@@ -1,14 +1,14 @@
-const {getDb} = require('../config/db');
+const { getDb } = require('../config/db');
 const bcrypt = require('bcrypt');
 
-const signup = async(req, res) =>{
+const signup = async (req, res) => {
 
     try {
 
-        const {name, phone_no, email, password} = req.body;
+        const { name, phone_no, email, password } = req.body;
 
-        if(!name || !phone_no || !email || !password){
-            return res.status(400).json({ message : "All fields are required"})
+        if (!name || !phone_no || !email || !password) {
+            return res.status(400).json({ message: "All fields are required" })
         }
 
         if (password.length < 6) {
@@ -19,10 +19,10 @@ const signup = async(req, res) =>{
 
         const db = getDb();
 
-        const existingUser = await db.collection('users').findOne({ normalizedEmail });
+        const existingUser = await db.collection('users').findOne({ email: normalizedEmail });
 
-        if(existingUser){
-            return res.status(400).json({ message : "User already exists"})
+        if (existingUser) {
+            return res.status(400).json({ message: "User already exists" })
         }
 
         const hasehpassword = await bcrypt.hash(password, 10);
@@ -37,11 +37,11 @@ const signup = async(req, res) =>{
 
         await db.collection('users').insertOne(newUser);
 
-        return res.status(201).json({ message : "User registered successfully"})
-        
+        return res.status(201).json({ message: "User registered successfully" })
+
     } catch (error) {
         console.error(error);
-        return res.status(500).json({ message : "Internal server error"})
+        return res.status(500).json({ message: "Internal server error" })
     }
 }
 
@@ -59,7 +59,7 @@ const login = async (req, res) => {
         const user = await db.collection('users').findOne({ email: normalizedEmail });
 
         if (!user) {
-            return res.status(401).json({ message: "User not found. Please signup to continue." });
+            return res.status(404).json({ message: "User not found. Please signup to continue." });
         }
 
         const isMatch = await bcrypt.compare(password, user.password);
@@ -86,4 +86,4 @@ const login = async (req, res) => {
     }
 };
 
-module.exports = {signup, login}
+module.exports = { signup, login }

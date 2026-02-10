@@ -16,7 +16,7 @@ const forgotpassword = async (req, res) => {
     const normalizedEmail = email.toLowerCase();
 
     const user = await db
-      .collection("staff")
+      .collection("users")
       .findOne({ email: normalizedEmail });
 
     if (!user) {
@@ -32,7 +32,7 @@ const forgotpassword = async (req, res) => {
 
     const otpExpiry = new Date(Date.now() + 10 * 60 * 1000);
 
-    await db.collection("staff").updateOne(
+    await db.collection("users").updateOne(
       { email: normalizedEmail },
       {
         $set: {
@@ -75,7 +75,7 @@ const otpValidation = async (req, res) => {
       .update(otp)
       .digest("hex");
 
-    const user = await db.collection("staff").findOne({
+    const user = await db.collection("users").findOne({
       email: normalizedEmail,
       resetOtp: hashedOtp,
       resetOtpExpiry: { $gt: new Date() },
@@ -87,7 +87,7 @@ const otpValidation = async (req, res) => {
       });
     }
 
-    await db.collection("staff").updateOne(
+    await db.collection("users").updateOne(
       { email: normalizedEmail },
       {
         $unset: {
@@ -131,7 +131,7 @@ const resetPassword = async (req, res) => {
 
     const normalizedEmail = email.toLowerCase();
 
-    const user = await db.collection("staff").findOne({
+    const user = await db.collection("users").findOne({
       email: normalizedEmail,
     });
 
@@ -144,7 +144,7 @@ const resetPassword = async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(newPassword, salt);
 
-    await db.collection("staff").updateOne(
+    await db.collection("users").updateOne(
       { email: normalizedEmail },
       {
         $set: {
