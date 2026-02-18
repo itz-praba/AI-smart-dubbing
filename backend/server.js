@@ -6,11 +6,17 @@ require('dotenv').config();
 
 const backend_routes = require('./routes/index');
 
+const setupProxy = require("./config/proxy");
+
 const connectDB = require('./config/db');
 
 const app = express();
 
 const port = process.env.PORT || 5000;
+
+app.use(express.json());
+
+setupProxy(app);
 
 connectDB();
 app.use(cors({

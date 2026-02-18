@@ -1,29 +1,44 @@
-const nodemailer = require("nodemailer");
+import os
+import smtplib
+from email.message import EmailMessage
+from datetime import datetime
 
-const transporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-});
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASS = os.getenv("EMAIL_PASS")
 
-async function sendOtpEmail({ to, otp }) {
-  return transporter.sendMail({
-    from: `"AI-SMART-DUBBING" <${process.env.EMAIL_USER}>`,
-    to,
-    subject: "Your Password Reset OTP",
-    text: `
+
+def send_otp_email(*, to: str, otp: str):
+    """
+    Send OTP email (HTML + text)
+    Equivalent to nodemailer.sendMail()
+    """
+
+    if not EMAIL_USER or not EMAIL_PASS:
+        raise RuntimeError("EMAIL_USER or EMAIL_PASS not set")
+
+    msg = EmailMessage()
+
+    # Headers (same as nodemailer)
+    msg["From"] = f"AI-SMART-DUBBING <{EMAIL_USER}>"
+    msg["To"] = to
+    msg["Subject"] = "Your Password Reset OTP"
+
+    # ---------- Plain text ----------
+    text_content = f"""
 Password Reset Request
 
-Your One-Time Password (OTP) is: ${otp}
+Your One-Time Password (OTP) is: {otp}
 
 This OTP is valid for 10 minutes.
 If you did not request a password reset, please ignore this email.
 
 AI-SMART-DUBBING — Security Team
-`,
-    html: `
+"""
+
+    msg.set_content(text_content)
+
+    # ---------- HTML ----------
+    html_content = f"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -31,43 +46,38 @@ AI-SMART-DUBBING — Security Team
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Password Reset OTP</title>
   <style>
-    body {
+    body {{
       margin: 0;
       padding: 0;
       background-color: #f4f6f8;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    }
-
-    .container {
+    }}
+    .container {{
       max-width: 520px;
       margin: 40px auto;
       background: #ffffff;
       border-radius: 8px;
       overflow: hidden;
       box-shadow: 0 6px 20px rgba(0,0,0,0.08);
-    }
-
-    .header {
+    }}
+    .header {{
       background: linear-gradient(135deg, #4f46e5, #6366f1);
       color: #ffffff;
       padding: 24px;
       text-align: center;
-    }
-
-    .header h1 {
+    }}
+    .header h1 {{
       margin: 0;
       font-size: 22px;
       font-weight: 600;
-    }
-
-    .content {
+    }}
+    .content {{
       padding: 32px;
       color: #374151;
       line-height: 1.6;
       font-size: 15px;
-    }
-
-    .otp-box {
+    }}
+    .otp-box {{
       margin: 24px 0;
       padding: 18px;
       text-align: center;
@@ -78,42 +88,33 @@ AI-SMART-DUBBING — Security Team
       border: 1px dashed #c7d2fe;
       border-radius: 6px;
       color: #111827;
-    }
-
-    .info {
+    }}
+    .info {{
       font-size: 14px;
       color: #6b7280;
       margin-top: 16px;
-    }
-
-    .footer {
+    }}
+    .footer {{
       padding: 20px;
       text-align: center;
       font-size: 12px;
       color: #9ca3af;
       background: #f9fafb;
-    }
-
-    @media (prefers-color-scheme: dark) {
-      body {
-        background-color: #0f172a;
-      }
-      .container {
-        background: #020617;
-      }
-      .content {
-        color: #e5e7eb;
-      }
-      .otp-box {
+    }}
+    @media (prefers-color-scheme: dark) {{
+      body {{ background-color: #0f172a; }}
+      .container {{ background: #020617; }}
+      .content {{ color: #e5e7eb; }}
+      .otp-box {{
         background: #020617;
         color: #ffffff;
         border-color: #6366f1;
-      }
-      .footer {
+      }}
+      .footer {{
         background: #020617;
         color: #94a3b8;
-      }
-    }
+      }}
+    }}
   </style>
 </head>
 
@@ -125,13 +126,12 @@ AI-SMART-DUBBING — Security Team
 
     <div class="content">
       <p>Hello,</p>
-
       <p>
         We received a request to reset your password.  
         Please use the One-Time Password (OTP) below to continue:
       </p>
 
-      <div class="otp-box">${otp}</div>
+      <div class="otp-box">{otp}</div>
 
       <p class="info">
         ⏳ This OTP is valid for <strong>10 minutes</strong> only.
@@ -139,7 +139,6 @@ AI-SMART-DUBBING — Security Team
 
       <p class="info">
         🔒 For your security, never share this OTP with anyone.
-        Our team will never ask for it.
       </p>
 
       <p class="info">
@@ -150,13 +149,20 @@ AI-SMART-DUBBING — Security Team
     </div>
 
     <div class="footer">
-      © ${new Date().getFullYear()} AI-SMART-DUBBING. All rights reserved.
+      © {datetime.utcnow().year} AI-SMART-DUBBING. All rights reserved.
     </div>
   </div>
 </body>
 </html>
-`,
-  });
-}
+"""
 
-module.exports = { sendOtpEmail };
+    msg.add_alternative(html_content, subtype="html")
+
+    # ---------- Send email ----------
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(EMAIL_USER, EMAIL_PASS)
+            server.send_message(msg)
+    except Exception as e:
+        print("OTP email send failed:", e)
+        raise

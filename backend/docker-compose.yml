@@ -1,0 +1,112 @@
+version: '3.8'
+
+services:
+  media-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: media-processing-api
+    ports:
+      - "8000:8000"
+    environment:
+      # AWS Credentials
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      
+      # HuggingFace Token (for speaker diarization)
+      - HF_TOKEN=${HF_TOKEN}
+      
+      # FFmpeg paths
+      - FFMPEG_PATH=ffmpeg
+      - FFPROBE_PATH=ffprobe
+      
+      # Model cache directory
+      - MODEL_CACHE_DIR=/app/models
+    
+    volumes:
+      # Persist temporary files (optional, can be commented out)
+      - ./temp:/app/temp
+      
+      # Cache downloaded models (highly recommended)
+      - ./models:/app/models
+      
+      # Mount source code for development (REMOVE IN PRODUCTION)
+      # Uncomment these lines for development hot-reload:
+      # - ./main.py:/app/main.py
+      # - ./audio_controller.py:/app/audio_controller.py
+      # - ./text_controller.py:/app/text_controller.py
+      # - ./target_language.py:/app/target_language.py
+      # - ./voice_cloning.py:/app/voice_cloning.py
+      # - ./lip_sync.py:/app/lip_sync.py
+      # - ./video_rendering.py:/app/video_rendering.py
+    
+    restart: unless-stopped
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    
+    # GPU support (uncomment for NVIDIA GPU)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    
+    # Resource limits
+    # Adjust based on your server capacity
+    mem_limit: 16g
+    memswap_limit: 16g
+    # For GPU instances, increase memory:
+    # mem_limit: 32g
+    # memswap_limit: 32g
+    
+    # CPU limits (optional)
+    # cpus: 4
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Optional: Add a reverse proxy (uncomment if needed)
+# nginx:
+#   image: nginx:alpine
+#   container_name: nginx-proxy
+#   ports:
+#     - "80:80"
+#     - "443:443"
+#   volumes:
+#     - ./nginx.conf:/etc/nginx/nginx.conf:ro
+#     - ./ssl:/etc/nginx/ssl:ro
+#   depends_on:
+#     - media-api
+#   restart: unless-stopped
+
+# Optional: Add monitoring (uncomment if needed)
+# prometheus:
+#   image: prom/prometheus
+#   container_name: prometheus
+#   ports:
+#     - "9090:9090"
+#   volumes:
+#     - ./prometheus.yml:/etc/prometheus/prometheus.yml
+#   restart: unless-stopped
+
+# grafana:
+#   image: grafana/grafana
+#   container_name: grafana
+#   ports:
+#     - "3000:3000"
+#   environment:
+#     - GF_SECURITY_ADMIN_PASSWORD=admin
+#   restart: unless-stopped
