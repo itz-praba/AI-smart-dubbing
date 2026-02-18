@@ -1,3 +1,8 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+
 :root {
   font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
   line-height: 1.5;
@@ -24,10 +29,8 @@ a:hover {
 
 body {
   margin: 0;
-  display: flex;
-  place-items: center;
   min-width: 320px;
-  min-height: 100vh;
+  min-height: 100vh;  
 }
 
 h1 {
@@ -66,3 +69,18 @@ button:focus-visible {
     background-color: #f9f9f9;
   }
 }
+
+.glass {
+  @apply bg-white/5 backdrop-blur-xl border border-white/10;
+}
+
+.glow-border {
+  box-shadow:
+    0 0 0 1px rgba(34, 211, 238, 0.15),
+    0 0 40px rgba(34, 211, 238, 0.05);
+}
+
+.text-gradient {
+  @apply bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent;
+}
+

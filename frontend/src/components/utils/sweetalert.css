@@ -1,0 +1,16 @@
+.dark-swal-popup {
+  border-radius: 12px;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
+  font-family: inherit;
+}
+
+.dark-swal-title {
+  font-size: 1.25rem;
+  font-weight: 600;
+}
+
+.dark-swal-btn {
+  padding: 8px 20px;
+  border-radius: 8px;
+  font-weight: 500;
+}

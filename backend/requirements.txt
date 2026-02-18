@@ -1,0 +1,63 @@
+# ============================================
+# FINAL COMPLETE REQUIREMENTS.TXT
+# All dependencies explicitly listed
+# Python 3.10 or 3.11
+# ============================================
+
+# ===== COMPLEX PACKAGES (Install Separately) =====
+# faster-whisper==1.0.0
+# pyannote.audio==3.1.1
+# TTS==0.22.0
+
+# ===== CORE DEPENDENCIES (Install First) =====
+six
+jmespath>=0.7.1
+python-dateutil>=2.1
+urllib3<2.1,>=1.25.4
+s3transfer>=0.10.0
+typing-extensions>=4.8.0
+annotated-types>=0.6.0
+click>=7.0
+h11>=0.8
+anyio>=3.4.0
+
+# ===== PYDANTIC & VALIDATION =====
+pydantic-core==2.14.6
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# ===== WEB FRAMEWORK =====
+starlette==0.35.1
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+python-dotenv==1.0.0
+
+# ===== AWS SDK =====
+botocore==1.34.34
+boto3==1.34.34
+
+# ===== PYTORCH =====
+# Install separately: pip install torch==2.1.2 torchaudio==2.1.2
+# torch==2.1.2
+# torchaudio==2.1.2
+
+# ===== AUDIO PROCESSING =====
+soundfile==0.12.1
+librosa==0.10.1
+pydub==0.25.1
+pyrubberband==0.3.0
+resampy==0.4.2
+audioread==3.0.1
+
+# ===== TRANSLATION =====
+transformers==4.33.0
+sentencepiece==0.1.99
+sacremoses==0.1.1
+
+# ===== NUMPY =====
+numpy<2.0.0
+
+# ===== PRODUCTION =====
+gunicorn==21.2.0
+python-json-logger==2.0.7
