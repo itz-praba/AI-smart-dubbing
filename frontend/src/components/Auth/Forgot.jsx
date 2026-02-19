@@ -22,7 +22,7 @@ function Forgot() {
 
     try {
       await axios.post(
-        "http://localhost:5000/api/backend/forgot-password",
+        "http://localhost:8001/forgot-password",
         { email },
         {
           headers: { "Content-Type": "application/json" },

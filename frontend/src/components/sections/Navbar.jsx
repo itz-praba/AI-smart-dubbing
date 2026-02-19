@@ -23,7 +23,7 @@ export default function Navbar() {
     const checkAuth = async () => {
       try {
         const res = await axios.get(
-          "http://localhost:5000/api/backend/me",
+          "http://localhost:8001/me",
           { withCredentials: true }
         );
         setAuthenticated(res.data.authenticated === true);
@@ -39,7 +39,7 @@ export default function Navbar() {
 
   const handleLogout = async () => {
     await axios.post(
-      "http://localhost:5000/api/backend/logout",
+      "http://localhost:8001/logout",
       {},
       { withCredentials: true }
     );

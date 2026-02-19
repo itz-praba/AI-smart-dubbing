@@ -69,7 +69,7 @@ export default function Footer() {
               </a>
 
               <a
-                href="#"
+                href="https://github.com/itz-praba"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="p-2 rounded-lg border border-white/10 hover:text-cyan-400 hover:border-cyan-400/40 transition"
@@ -78,7 +78,7 @@ export default function Footer() {
               </a>
 
               <a
-                href="#"
+                href="https://www.linkedin.com/in/itz-praba/"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="p-2 rounded-lg border border-white/10 hover:text-cyan-400 hover:border-cyan-400/40 transition"

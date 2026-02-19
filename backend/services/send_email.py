@@ -7,7 +7,7 @@ EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASS = os.getenv("EMAIL_PASS")
 
 
-def send_otp_email(*, to: str, otp: str):
+async def send_otp_email(to: str, otp: str):
     """
     Send OTP email (HTML + text)
     Equivalent to nodemailer.sendMail()

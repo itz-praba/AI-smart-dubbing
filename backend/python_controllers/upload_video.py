@@ -3,7 +3,7 @@ import uuid
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from botocore.exceptions import ClientError
 
-from s3_client import s3
+from config.s3 import s3
 
 router = APIRouter()
 

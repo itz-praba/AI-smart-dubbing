@@ -9,16 +9,22 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 @router.post("/signup")
 async def signup(data: dict):
+    print("Incoming data:", data)
     name = data.get("name", "").strip()
     phone_no = data.get("phone_no", "").strip()
     email = data.get("email", "").strip()
     password = data.get("password", "")
+    confirmPassword = data.get("confirmPassword", "")
 
-    if not all([name, phone_no, email, password]):
+    if not all([name, phone_no, email, password, confirmPassword]):
         raise HTTPException(status_code=400, detail="All fields are required")
 
     if len(password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    if password != confirmPassword :
+        raise HTTPException(status_code=400, detail="Password do not match")
+
 
     email = email.lower()
     db = get_db()

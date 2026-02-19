@@ -30,7 +30,7 @@ export default function Contact() {
     setLoading(true);
 
     try {
-      await axios.post("http://localhost:5000/api/backend/contact", form);
+      await axios.post("http://localhost:8001/contact", form);
 
       darkAlert.fire({
         icon: "success",
