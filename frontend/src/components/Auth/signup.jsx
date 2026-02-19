@@ -75,7 +75,6 @@ function Signup() {
       return;
     }
 
-    const { confirmPassword, ...userData } = formData;
     setLoading(true);
     setError("");
 
@@ -83,11 +82,11 @@ function Signup() {
     darkAlert.fire({
       title: "Creating your account…",
       allowOutsideClick: false,
-      didOpen: () => Swal.showLoading(),
+      didOpen: () => darkAlert.showLoading(),
     });
 
     try {
-      await axios.post("http://localhost:5000/api/backend/signup", userData, {
+      await axios.post("http://localhost:8001/signup", formData, {
         headers: { "Content-Type": "application/json" },
         withCredentials: true,
       });
@@ -99,6 +98,7 @@ function Signup() {
         text: "You can now log in to your account",
         timer: 1500,
         showConfirmButton: false,
+        iconColor: "#22c55e",
       });
 
       navigate("/login");

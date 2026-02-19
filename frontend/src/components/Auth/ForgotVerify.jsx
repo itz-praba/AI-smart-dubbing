@@ -24,7 +24,7 @@ function ForgotVerify() {
 
     try {
       await axios.post(
-        "http://localhost:5000/api/backend/otp-validation",
+        "http://localhost:8001/validate-otp",
         { email, otp },
         {
           headers: { "Content-Type": "application/json" },

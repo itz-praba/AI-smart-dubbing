@@ -1,6 +1,6 @@
 export const checkSession = async () => {
   try {
-    const res = await fetch("http://localhost:5000/api/backend/me", {
+    const res = await fetch("http://localhost:8001/me", {
       method: "GET",
       credentials: "include", // 🔥 VERY IMPORTANT
     });

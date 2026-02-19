@@ -41,7 +41,7 @@ function ResetPassword() {
 
     try {
       await axios.post(
-        "http://localhost:5000/api/backend/reset-password",
+        "http://localhost:8001/reset-password",
         { email, newPassword, confirmPassword },
         {
           headers: { "Content-Type": "application/json" },

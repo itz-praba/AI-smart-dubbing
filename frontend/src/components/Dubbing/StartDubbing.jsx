@@ -87,6 +87,31 @@ export default function StartDubbing() {
 
           {/* Language Select */}
           <div className="space-y-2">
+            <label className="text-sm text-neutral-400">Video Language</label>
+
+            <div className="relative">
+              <select
+                className="w-full appearance-none bg-black/60 border border-cyan-400/30 rounded-xl
+                  px-4 py-3 pr-10 text-white focus:outline-none focus:border-cyan-400 transition"
+              >
+                <option value="">Select video language</option>
+                <option>English</option>
+                <option>Hindi</option>
+                <option>Spanish</option>
+                <option>French</option>
+                <option>German</option>
+                <option>Japanese</option>
+              </select>
+
+              <span className="pointer-events-none absolute inset-y-0 right-4 flex items-center text-cyan-400">
+                ▼
+              </span>
+            </div>
+          </div>
+
+
+          {/* Language Select */}
+          <div className="space-y-2">
             <label className="text-sm text-neutral-400">Target Language</label>
 
             <div className="relative">

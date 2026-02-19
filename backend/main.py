@@ -20,7 +20,8 @@ from middleware.security import setup_middleware
 from python_controllers.auth_controller import router as auth_router
 from python_controllers.contact_controller import router as contact_router
 from python_controllers.forgot_password import router as password_router
-from python_controllers.audio_controller import router as video_router
+from python_controllers.upload_video import router as video_router
+from python_controllers.audio_controller import router as audio_router
 from python_controllers.text_controller import router as speech_router
 from python_controllers.target_language import router as translation_router
 from python_controllers.lip_sync import router as lipsync_router
@@ -49,23 +50,24 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
-
+print("CORS_ORIGINS:", os.getenv("CORS_ORIGINS"))
 
 # ── Middleware ──────────────────────────────────────────────────────────────
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 app.add_middleware(
     SessionMiddleware,
     secret_key=os.getenv("SESSION_SECRET", "SUPER_SECRET_KEY"),
     same_site="lax",
     https_only=False,
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 setup_middleware(app, {
     "rate_limit": {
@@ -94,6 +96,7 @@ app.include_router(contact_router)
 app.include_router(password_router)
 app.include_router(pipeline_router)
 app.include_router(video_router)
+app.include_router(audio_router)
 app.include_router(speech_router)
 app.include_router(translation_router)
 app.include_router(lipsync_router)
@@ -167,4 +170,4 @@ async def global_exception_handler(request, exc):
 # ── Run ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)
