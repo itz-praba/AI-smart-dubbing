@@ -37,7 +37,7 @@ logger.info(f"Translation service using device: {DEVICE}")
 SUPPORTED_LANGS = {
     "en", "es", "fr", "de", "it", "pt", "nl", "ru", 
     "zh", "ja", "ko", "ar", "tr", "pl", "vi", "uk",
-    "cs", "da", "fi", "no", "sv", "el", "he", "th"
+    "cs", "da", "fi", "no", "sv", "el", "he", "th",
 }
 
 # Language names for better UX
@@ -66,6 +66,7 @@ MARIAN_MODELS = {
     "ru-en": "Helsinki-NLP/opus-mt-ru-en",
     "en-zh": "Helsinki-NLP/opus-mt-en-zh",
     "zh-en": "Helsinki-NLP/opus-mt-zh-en",
+    "ta-en": "Helsinki-NLP/opus-mt-mul-en",
 }
 
 # Fallback model for unsupported pairs

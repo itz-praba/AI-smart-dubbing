@@ -37,7 +37,8 @@ MAX_AUDIO_DURATION = 3600  # 1 hour in seconds
 ALLOWED_AUDIO_EXTENSIONS = {'.wav', '.mp3', '.m4a', '.flac', '.ogg', '.opus', '.wma'}
 SUPPORTED_LANGUAGES = [
     'en', 'es', 'fr', 'de', 'it', 'pt', 'nl', 'ru', 'zh', 'ja', 'ko',
-    'ar', 'hi', 'tr', 'pl', 'cs', 'sv', 'da', 'fi', 'no', 'uk', 'vi'
+    'ar', 'hi', 'tr', 'pl', 'cs', 'sv', 'da', 'fi', 'no', 'uk', 'vi',
+    "ta"
 ]
 
 # Whisper model sizes and their memory requirements
@@ -158,7 +159,7 @@ def get_diarization_pipeline() -> Optional[Pipeline]:
             logger.info("Loading speaker diarization pipeline")
             _diarization_pipeline = Pipeline.from_pretrained(
                 "pyannote/speaker-diarization-3.1",
-                token=HUGGINGFACE_TOKEN
+                use_auth_token=HUGGINGFACE_TOKEN
             )
             
             # Move to appropriate device
@@ -471,6 +472,47 @@ def upload_to_s3(local_path: str, bucket: str, key: str, metadata: dict = None) 
 
 
 def perform_diarization(audio_path: str) -> List[Dict[str, Any]]:
+    speaker_segments = []
+
+    try:
+        diarization_pipeline = get_diarization_pipeline()
+
+        if diarization_pipeline is None:
+            logger.warning("Diarization pipeline not available")
+            return speaker_segments
+
+        logger.info("Starting speaker diarization")
+        diarization = diarization_pipeline(audio_path)
+
+        # 🔍 DEBUG: log type and available attributes
+        logger.info(f"Diarization object type: {type(diarization)}")
+        logger.info(f"Available attributes: {dir(diarization)}")
+
+        # ❌ Check if old attribute exists
+        if hasattr(diarization, "speaker_diarization"):
+            logger.info("Found attribute: speaker_diarization")
+            annotation = diarization.speaker_diarization
+        else:
+            logger.error("Attribute 'speaker_diarization' NOT found.")
+            annotation = diarization  # fallback to direct annotation
+
+        # ✅ Correct for pyannote 3.x
+        for segment, _, speaker in annotation.itertracks(yield_label=True):
+            speaker_segments.append({
+                "speaker": speaker,
+                "start": round(segment.start, 2),
+                "end": round(segment.end, 2)
+            })
+
+        logger.info(
+            f"Diarization complete: {len(speaker_segments)} segments, "
+            f"{len(set(s['speaker'] for s in speaker_segments))} unique speakers"
+        )
+
+    except Exception as e:
+        logger.error(f"Diarization failed: {e}", exc_info=True)
+
+    return speaker_segments
     """
     Perform speaker diarization on audio file
     
@@ -480,35 +522,6 @@ def perform_diarization(audio_path: str) -> List[Dict[str, Any]]:
     Returns:
         List of speaker segments
     """
-    speaker_segments = []
-    
-    try:
-        diarization_pipeline = get_diarization_pipeline()
-        
-        if diarization_pipeline is None:
-            logger.warning("Diarization pipeline not available")
-            return speaker_segments
-        
-        logger.info("Starting speaker diarization")
-        diarization = diarization_pipeline(audio_path)
-
-        annotation = diarization.speaker_diarization
-        
-        for segment, _, speaker in annotation.itertracks(yield_label=True):
-            speaker_segments.append({
-                "speaker": speaker,
-                "start": round(segment.start, 2),
-                "end":  round(segment.end, 2)
-            })
-        
-        logger.info(f"Diarization complete: {len(speaker_segments)} segments, "
-                   f"{len(set(s['speaker'] for s in speaker_segments))} unique speakers")
-        
-    except Exception as e:
-        logger.error(f"Diarization failed: {e}", exc_info=True)
-        # Don't raise - continue without diarization
-    
-    return speaker_segments
 
 
 def transcribe_audio(

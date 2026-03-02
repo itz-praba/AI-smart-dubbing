@@ -58,7 +58,7 @@ SUPPORTED_LANGUAGES = {
     "ja": "Japanese",
     "hu": "Hungarian",
     "ko": "Korean",
-    "hi": "Hindi"
+    "hi": "Hindi",
 }
 
 # File constraints
@@ -92,7 +92,7 @@ for env_var in REQUIRED_ENV_VARS:
 try:
     boto_config = Config(
         retries={
-            'max_attempts': 3,
+            'max_attempts': 5,
             'mode': 'standard'
         },
         connect_timeout=10,
