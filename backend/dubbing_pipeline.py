@@ -21,6 +21,7 @@ from datetime import datetime
 
 import boto3
 import torch
+import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, validator
 from botocore.config import Config
@@ -50,7 +51,7 @@ LANG_2_TO_3 = {
     "hi": "hin", "tr": "tur", "pl": "pol", "uk": "ukr",
     "cs": "ces", "da": "dan", "fi": "fin", "no": "nor",
     "sv": "swe", "el": "ell", "he": "heb", "th": "tha",
-    "vi": "vie",
+    "vi": "vie", "ta": "tam"
 }
 
 s3_client = boto3.client(
@@ -107,7 +108,7 @@ class DubbingRequest(BaseModel):
             return v
         supported = {
             "en","es","fr","de","it","pt","nl","ru","zh","ja","ko",
-            "ar","hi","tr","pl","uk","cs","da","fi","no","sv","el","he","th","vi",
+            "ar","hi","tr","pl","uk","cs","da","fi","no","sv","el","he","th","vi","ta"
         }
         if v.lower() not in supported:
             raise ValueError(f"Unsupported language '{v}'. Supported: {sorted(supported)}")
@@ -233,66 +234,58 @@ async def _step3_translate(pipeline_id, transcript_bucket, transcript_key,
     logger.info(f"[{pipeline_id}] Step 3 ✓ → {len(translated)} segments translated")
     return translated
 
+async def _step4_voice_clone(
+    pipeline_id,
+    translated_segments,
+    audio_bucket,
+    audio_key,
+    output_bucket,
+    target_lang,
+    prefix,
+):
+    updated_segments = []
 
-async def _step4_voice_clone(pipeline_id, translated_segments, transcript_bucket,
-                              transcript_key, output_bucket, target_lang, prefix):
-    try:
-        from python_controllers.voice_cloning import VoiceCloneRequest, voice_clone_tts
-        has_vc = True
-    except ImportError:
-        has_vc = False
-        logger.warning(f"[{pipeline_id}] voice_cloning module not found – using TTS fallback")
-
-    transcript      = _s3_read_json(transcript_bucket, transcript_key)
-    raw_segments    = transcript.get("segments", [])
-    speaker_ref_map: Dict[str, Optional[str]] = {}
-    for seg in raw_segments:
-        spk = seg.get("speaker", "SPEAKER_00")
-        if spk not in speaker_ref_map:
-            speaker_ref_map[spk] = seg.get("audio_key")
-
-    updated = []
     for seg in translated_segments:
-        spk      = seg["speaker"]
-        tts_key  = f"{prefix}tts/{spk}_{seg['index']:04d}.wav"
+        output_key_prefix = f"{prefix}tts/segment_{seg['index']:04d}/"
 
-        if has_vc and speaker_ref_map.get(spk):
-            req  = VoiceCloneRequest(
-                text=seg["translated_text"],
-                reference_audio_bucket=output_bucket,
-                reference_audio_key=speaker_ref_map[spk],
-                output_bucket=output_bucket,
-                output_key=tts_key,
-                language=target_lang,
-                speaker_name=spk,
+        payload = {
+            "speaker_audio_bucket": audio_bucket,
+            "speaker_audio_key": audio_key,
+            "translated_text": seg["translated_text"],
+            "target_language": target_lang,
+            "output_bucket": output_bucket,
+            "output_key_prefix": output_key_prefix,
+            "speed": 1.0,
+        }
+
+        async with httpx.AsyncClient(timeout=600) as client:
+            response = await client.post(
+                "http://localhost:8002/ai/voice-clone-tts",
+                json=payload,
             )
-            result = await voice_clone_tts(req)
-            if not result.success:
-                tts_key = await _tts_fallback(seg, tts_key, output_bucket, target_lang, pipeline_id)
-        else:
-            tts_key = await _tts_fallback(seg, tts_key, output_bucket, target_lang, pipeline_id)
 
-        updated.append({**seg, "tts_audio_key": tts_key})
+        if response.status_code != 200:
+            raise HTTPException(
+                500,
+                f"Voice cloning microservice failed: {response.text}"
+            )
 
-    logger.info(f"[{pipeline_id}] Step 4 ✓ → {len(updated)} segments voiced")
-    return updated
+        result = response.json()
 
+        if not result.get("success"):
+            raise HTTPException(
+                500,
+                "Voice cloning returned success=false"
+            )
 
-async def _tts_fallback(seg, tts_key, output_bucket, target_lang, pipeline_id):
-    try:
-        from TTS.api import TTS as CoquiTTS
-        tts     = CoquiTTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2")
-        tmp_wav = str(TEMP_DIR / f"tts_{uuid.uuid4().hex}.wav")
-        tts.tts_to_file(text=seg["translated_text"], language=target_lang, file_path=tmp_wav)
-        s3_client.upload_file(
-            tmp_wav, output_bucket, tts_key,
-            ExtraArgs={"ContentType": "audio/wav", "ServerSideEncryption": "AES256"}
-        )
-        os.remove(tmp_wav)
-    except Exception as e:
-        logger.error(f"[{pipeline_id}] TTS fallback failed for seg {seg['index']}: {e}")
-    return tts_key
+        tts_key = result["output_key"]
 
+        logger.info(f"[{pipeline_id}] TTS generated: {tts_key}")
+
+        updated_segments.append({**seg, "tts_audio_key": tts_key})
+
+    logger.info(f"[{pipeline_id}] Step 4 ✓ → {len(updated_segments)} segments voiced")
+    return updated_segments
 
 async def _step5_lip_sync(pipeline_id, voiced_segments, output_bucket, prefix):
     from python_controllers.lip_sync import LipSyncRequest, TimedSegment as LS, lip_sync_align
@@ -430,7 +423,7 @@ async def dub_video(request: DubbingRequest) -> DubbingResponse:
     t = _step_timer()
     try:
         voiced_segments = await _step4_voice_clone(
-            pipeline_id, translated_segments, transcript_bucket, transcript_key,
+            pipeline_id, translated_segments, audio_bucket, audio_key,
             output_bucket, request.target_language, prefix)
         record("4-voice-cloning", "done", t())
     except Exception as e:

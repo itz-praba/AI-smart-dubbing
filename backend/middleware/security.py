@@ -240,34 +240,13 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
     Note: This is a soft timeout - actual processing may continue
     """
     
-    def __init__(self, app, timeout_seconds: int = 900):  # 15 minutes default
+    def __init__(self, app, timeout_seconds: int = 900):
         super().__init__(app)
         self.timeout_seconds = timeout_seconds
-    
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        import asyncio
-        
-        try:
-            response = await asyncio.wait_for(
-                call_next(request),
-                timeout=self.timeout_seconds
-            )
-            return response
-            
-        except asyncio.TimeoutError:
-            logger.error(
-                f"Request timeout after {self.timeout_seconds}s | "
-                f"Path: {request.url.path}"
-            )
-            return JSONResponse(
-                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                content={
-                    "error": "Request timeout",
-                    "detail": f"Request exceeded {self.timeout_seconds} seconds",
-                    "path": request.url.path
-                }
-            )
 
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        # Direct execution without timeout
+        return await call_next(request)
 
 # =====================================================
 # METRICS MIDDLEWARE
@@ -440,14 +419,8 @@ def setup_middleware(app, config: dict = None):
         )
         logger.info(f"✓ Request size limit enabled: {max_size_mb}MB")
     
-    # 7. Timeout (configurable)
-    timeout_config = config.get("timeout", {"enabled": True})
-    if timeout_config.get("enabled", True):
-        app.add_middleware(
-            TimeoutMiddleware,
-            timeout_seconds=timeout_config.get("timeout_seconds", 900)
-        )
-        logger.info(f"✓ Timeout middleware enabled: {timeout_config.get('timeout_seconds', 900)}s")
+    # 7. Timeout DISABLED
+    logger.info("✗ Timeout middleware disabled")
     
     # 8. API Key Authentication (optional, disabled by default)
     api_key_config = config.get("api_key", {"enabled": False})
