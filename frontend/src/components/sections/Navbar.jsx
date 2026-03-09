@@ -3,6 +3,7 @@ import { Menu, X, Mic } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useNavigate } from "react-router-dom";
 import axios from "axios";
+import darkAlert from "../utils/sweetalert";
 
 const navLinks = [
   { label: "Features", href: "features" },
@@ -44,6 +45,15 @@ export default function Navbar() {
       { withCredentials: true }
     );
     setAuthenticated(false);
+    // ✅ Success
+    darkAlert.fire({
+    icon: "success",
+    title: "Logout",
+    text: "Logout successful",
+    timer: 1500,
+    showConfirmButton: false,
+    iconColor: "#22c55e",
+    });
     navigate("/");
   };
 

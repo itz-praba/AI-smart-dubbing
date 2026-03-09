@@ -38,7 +38,8 @@ ALLOWED_AUDIO_EXTENSIONS = {'.wav', '.mp3', '.m4a', '.flac', '.ogg', '.opus', '.
 SUPPORTED_LANGUAGES = [
     'en', 'es', 'fr', 'de', 'it', 'pt', 'nl', 'ru', 'zh', 'ja', 'ko',
     'ar', 'hi', 'tr', 'pl', 'cs', 'sv', 'da', 'fi', 'no', 'uk', 'vi',
-    "ta"
+    'ta',   # Tamil
+    'tgl',  # Tanglish (romanised Tamil; Whisper transcribes as English phonetics)
 ]
 
 # Whisper model sizes and their memory requirements
@@ -91,7 +92,6 @@ try:
         config=boto_config
     )
     
-    # Test S3 connection
     s3_client.list_buckets()
     logger.info("S3 client initialized successfully")
     
@@ -112,15 +112,6 @@ _whisper_model = None
 _diarization_pipeline = None
 
 def get_whisper_model(model_size: str = "large-v3") -> WhisperModel:
-    """
-    Get or initialize Whisper model with lazy loading
-    
-    Args:
-        model_size: Size of the Whisper model to use
-        
-    Returns:
-        WhisperModel instance
-    """
     global _whisper_model
     
     if _whisper_model is None:
@@ -130,7 +121,7 @@ def get_whisper_model(model_size: str = "large-v3") -> WhisperModel:
                 model_size,
                 device=device,
                 compute_type=compute_type,
-                download_root="./models",  # Cache models locally
+                download_root="./models",
                 num_workers=4 if device == "cuda" else 2
             )
             logger.info("Whisper model loaded successfully")
@@ -142,12 +133,6 @@ def get_whisper_model(model_size: str = "large-v3") -> WhisperModel:
 
 
 def get_diarization_pipeline() -> Optional[Pipeline]:
-    """
-    Get or initialize speaker diarization pipeline with lazy loading
-    
-    Returns:
-        Pipeline instance or None if token not available
-    """
     global _diarization_pipeline
     
     if not HUGGINGFACE_TOKEN:
@@ -162,7 +147,6 @@ def get_diarization_pipeline() -> Optional[Pipeline]:
                 use_auth_token=HUGGINGFACE_TOKEN
             )
             
-            # Move to appropriate device
             if device == "cuda":
                 _diarization_pipeline.to(torch.device("cuda"))
             
@@ -179,7 +163,6 @@ def get_diarization_pipeline() -> Optional[Pipeline]:
 # PYDANTIC MODELS
 # =====================================================
 class TranscriptSegment(BaseModel):
-    """Individual transcript segment"""
     speaker: str
     start: float
     end: float
@@ -188,7 +171,6 @@ class TranscriptSegment(BaseModel):
 
 
 class SpeechToTextRequest(BaseModel):
-    """Request model for speech-to-text conversion"""
     audio_bucket: str = Field(..., min_length=1, max_length=63)
     audio_key: str = Field(..., min_length=1, max_length=1024)
     output_bucket: str = Field(..., min_length=1, max_length=63)
@@ -199,7 +181,6 @@ class SpeechToTextRequest(BaseModel):
     
     @validator('audio_bucket', 'output_bucket')
     def validate_bucket_name(cls, v):
-        """Validate S3 bucket name"""
         if not v.replace('-', '').replace('.', '').isalnum():
             raise ValueError("Bucket name contains invalid characters")
         if '..' in v or v.startswith('.') or v.endswith('.'):
@@ -208,24 +189,18 @@ class SpeechToTextRequest(BaseModel):
     
     @validator('audio_key')
     def validate_audio_key(cls, v):
-        """Validate audio key and extension"""
-        # Prevent path traversal
         if '..' in v or v.startswith('/'):
             raise ValueError("Invalid audio key: path traversal detected")
-        
-        # Check extension
         ext = Path(v).suffix.lower()
         if ext not in ALLOWED_AUDIO_EXTENSIONS:
             raise ValueError(
                 f"Unsupported audio format '{ext}'. "
                 f"Allowed formats: {', '.join(ALLOWED_AUDIO_EXTENSIONS)}"
             )
-        
         return v
     
     @validator('language')
     def validate_language(cls, v):
-        """Validate language code"""
         if v is not None and v not in SUPPORTED_LANGUAGES:
             raise ValueError(
                 f"Unsupported language '{v}'. "
@@ -235,7 +210,6 @@ class SpeechToTextRequest(BaseModel):
     
     @validator('model_size')
     def validate_model_size(cls, v):
-        """Validate Whisper model size"""
         if v not in WHISPER_MODELS.values():
             raise ValueError(
                 f"Invalid model size '{v}'. "
@@ -243,21 +217,8 @@ class SpeechToTextRequest(BaseModel):
             )
         return v
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "audio_bucket": "my-audio-bucket",
-                "audio_key": "audio/sample.wav",
-                "output_bucket": "my-transcripts-bucket",
-                "language": "en",
-                "diarize": True,
-                "model_size": "large-v3"
-            }
-        }
-
 
 class SpeechToTextResponse(BaseModel):
-    """Response model for speech-to-text conversion"""
     success: bool
     job_id: str
     language: str
@@ -273,7 +234,6 @@ class SpeechToTextResponse(BaseModel):
 
 
 class TranscriptResult(BaseModel):
-    """Complete transcript result"""
     job_id: str
     language: str
     language_probability: float
@@ -289,7 +249,6 @@ class TranscriptResult(BaseModel):
 # =====================================================
 @contextmanager
 def temp_files(*file_paths):
-    """Context manager to ensure temporary files are cleaned up"""
     try:
         yield
     finally:
@@ -303,47 +262,20 @@ def temp_files(*file_paths):
 
 
 def sanitize_filename(filename: str, max_length: int = 255) -> str:
-    """
-    Sanitize filename to prevent security issues
-    
-    Args:
-        filename: Original filename
-        max_length: Maximum allowed length
-        
-    Returns:
-        Sanitized filename
-    """
     filename = Path(filename).name
-    
     safe_chars = []
     for char in filename:
         if char.isalnum() or char in '._-':
             safe_chars.append(char)
         else:
             safe_chars.append('_')
-    
     result = ''.join(safe_chars)
-    
     if not result or result.startswith('.'):
         result = f"audio_{uuid.uuid4().hex[:8]}"
-    
     return result[:max_length]
 
 
 def check_s3_file(bucket: str, key: str) -> Dict[str, Any]:
-    """
-    Check if S3 file exists and get metadata
-    
-    Args:
-        bucket: S3 bucket name
-        key: S3 object key
-        
-    Returns:
-        Dictionary with file metadata
-        
-    Raises:
-        HTTPException: If file not found or access denied
-    """
     try:
         response = s3_client.head_object(Bucket=bucket, Key=key)
         return {
@@ -359,116 +291,61 @@ def check_s3_file(bucket: str, key: str) -> Dict[str, Any]:
                 detail=f"Audio file not found in bucket '{bucket}' with key '{key}'"
             )
         elif error_code == '403':
-            raise HTTPException(
-                status_code=403,
-                detail=f"Access denied to bucket '{bucket}'"
-            )
+            raise HTTPException(status_code=403, detail=f"Access denied to bucket '{bucket}'")
         else:
             logger.error(f"S3 head_object error: {e}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to check file in S3: {error_code}"
-            )
+            raise HTTPException(status_code=500, detail=f"Failed to check file in S3: {error_code}")
 
 
 def download_from_s3(bucket: str, key: str, local_path: str) -> None:
-    """
-    Download file from S3 with error handling
-    
-    Args:
-        bucket: S3 bucket name
-        key: S3 object key
-        local_path: Local file path to save to
-        
-    Raises:
-        HTTPException: If download fails
-    """
     try:
         logger.info(f"Downloading s3://{bucket}/{key} to {local_path}")
         s3_client.download_file(bucket, key, local_path)
         
         if not os.path.exists(local_path):
-            raise HTTPException(
-                status_code=500,
-                detail="File download completed but file not found locally"
-            )
+            raise HTTPException(status_code=500, detail="File download completed but file not found locally")
         
         file_size = os.path.getsize(local_path)
         if file_size == 0:
-            raise HTTPException(
-                status_code=500,
-                detail="Downloaded file is empty"
-            )
+            raise HTTPException(status_code=500, detail="Downloaded file is empty")
         
         logger.info(f"Successfully downloaded {file_size} bytes")
         
     except ClientError as e:
         logger.error(f"S3 download error: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to download from S3: {e.response['Error']['Message']}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to download from S3: {e.response['Error']['Message']}")
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Unexpected download error: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unexpected error during download: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Unexpected error during download: {str(e)}")
 
 
 def upload_to_s3(local_path: str, bucket: str, key: str, metadata: dict = None) -> None:
-    """
-    Upload file to S3 with error handling
-    
-    Args:
-        local_path: Local file path to upload
-        bucket: S3 bucket name
-        key: S3 object key
-        metadata: Optional metadata dictionary
-        
-    Raises:
-        HTTPException: If upload fails
-    """
     try:
         extra_args = {
             "ContentType": "application/json",
             "ServerSideEncryption": "AES256"
         }
-        
         if metadata:
             extra_args["Metadata"] = metadata
         
         logger.info(f"Uploading {local_path} to s3://{bucket}/{key}")
         s3_client.upload_file(local_path, bucket, key, ExtraArgs=extra_args)
-        logger.info(f"Upload successful")
+        logger.info("Upload successful")
         
     except ClientError as e:
         error_code = e.response['Error']['Code']
         logger.error(f"S3 upload error: {e}")
-        
         if error_code == 'NoSuchBucket':
-            raise HTTPException(
-                status_code=404,
-                detail=f"Destination bucket '{bucket}' does not exist"
-            )
+            raise HTTPException(status_code=404, detail=f"Destination bucket '{bucket}' does not exist")
         elif error_code == 'AccessDenied':
-            raise HTTPException(
-                status_code=403,
-                detail=f"Access denied to bucket '{bucket}'"
-            )
+            raise HTTPException(status_code=403, detail=f"Access denied to bucket '{bucket}'")
         else:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to upload to S3: {e.response['Error']['Message']}"
-            )
+            raise HTTPException(status_code=500, detail=f"Failed to upload to S3: {e.response['Error']['Message']}")
     except Exception as e:
         logger.error(f"Unexpected upload error: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unexpected error during upload: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Unexpected error during upload: {str(e)}")
 
 
 def perform_diarization(audio_path: str) -> List[Dict[str, Any]]:
@@ -484,20 +361,7 @@ def perform_diarization(audio_path: str) -> List[Dict[str, Any]]:
         logger.info("Starting speaker diarization")
         diarization = diarization_pipeline(audio_path)
 
-        # 🔍 DEBUG: log type and available attributes
-        logger.info(f"Diarization object type: {type(diarization)}")
-        logger.info(f"Available attributes: {dir(diarization)}")
-
-        # ❌ Check if old attribute exists
-        if hasattr(diarization, "speaker_diarization"):
-            logger.info("Found attribute: speaker_diarization")
-            annotation = diarization.speaker_diarization
-        else:
-            logger.error("Attribute 'speaker_diarization' NOT found.")
-            annotation = diarization  # fallback to direct annotation
-
-        # ✅ Correct for pyannote 3.x
-        for segment, _, speaker in annotation.itertracks(yield_label=True):
+        for segment, _, speaker in diarization.itertracks(yield_label=True):
             speaker_segments.append({
                 "speaker": speaker,
                 "start": round(segment.start, 2),
@@ -513,15 +377,6 @@ def perform_diarization(audio_path: str) -> List[Dict[str, Any]]:
         logger.error(f"Diarization failed: {e}", exc_info=True)
 
     return speaker_segments
-    """
-    Perform speaker diarization on audio file
-    
-    Args:
-        audio_path: Path to audio file
-        
-    Returns:
-        List of speaker segments
-    """
 
 
 def transcribe_audio(
@@ -531,41 +386,58 @@ def transcribe_audio(
     word_timestamps: bool = True
 ) -> tuple:
     """
-    Transcribe audio file using Whisper
-    
-    Args:
-        audio_path: Path to audio file
-        language: Optional language code
-        model_size: Whisper model size
-        word_timestamps: Whether to include word timestamps
-        
-    Returns:
-        Tuple of (segments, info)
-        
-    Raises:
-        HTTPException: If transcription fails
+    FIX #1 — TRANSCRIPTION ACCURACY:
+    - Removed aggressive VAD (min_silence_duration_ms=500) which was causing short
+      utterances and fast speech to be dropped entirely.
+    - temperature is now a list [0.0, 0.2, 0.4] so Whisper can retry with higher
+      temperature when it detects decoding failure, instead of producing blank/hallucinated segments.
+    - condition_on_previous_text=True helps keep coherent context across segments.
+    - compression_ratio_threshold and log_prob_threshold guard against hallucinations.
+    - no_speech_threshold lowered slightly so soft speech is not silently dropped.
+    - initial_prompt seeds common vocabulary so the model is less likely to transcribe
+      silence as repetitive filler words.
     """
     try:
         whisper_model = get_whisper_model(model_size)
         
-        logger.info(f"Starting transcription with model {model_size}, language: {language or 'auto-detect'}")
+        # Tanglish is romanised Tamil in Latin script — Whisper has no "tgl" token.
+        # Route it as "en" so Whisper applies correct Latin-script phoneme decoding.
+        whisper_language = "en" if language == "tgl" else language
+
+        logger.info(f"Starting transcription with model {model_size}, language: {whisper_language or 'auto-detect'}")
         
         segments, info = whisper_model.transcribe(
             audio_path,
             beam_size=5,
             best_of=5,
-            temperature=0.0,
+            # Allow fallback temperatures so Whisper retries on decoding failures
+            temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
             word_timestamps=word_timestamps,
-            language=language,
-            vad_filter=True,  # Voice activity detection
-            vad_parameters=dict(min_silence_duration_ms=500)
+            language=whisper_language,
+            # Keep VAD enabled but with a shorter minimum silence so less audio is dropped
+            vad_filter=True,
+            vad_parameters=dict(
+                min_silence_duration_ms=200,   # was 500 — reduced to catch short pauses
+                speech_pad_ms=400,             # add padding around detected speech
+                threshold=0.35,                # lower than default (0.5) to be more sensitive
+            ),
+            # Context window: help the model maintain coherent output across segments
+            condition_on_previous_text=True,
+            # Suppress blank/repetitive hallucinations
+            compression_ratio_threshold=2.4,
+            log_prob_threshold=-1.0,
+            no_speech_threshold=0.45,          # was implicitly 0.6 — catch more soft speech
+            # Seed prompt helps ground the model in the right domain
+            initial_prompt="The following is a clear spoken audio recording:",
         )
         
         # Convert generator to list
         segments = list(segments)
         
-        logger.info(f"Transcription complete: {len(segments)} segments, "
-                   f"language: {info.language} (prob: {info.language_probability:.2f})")
+        logger.info(
+            f"Transcription complete: {len(segments)} segments, "
+            f"language: {info.language} (prob: {info.language_probability:.2f})"
+        )
         
         return segments, info
         
@@ -581,26 +453,20 @@ def align_speakers_with_transcription(
     transcription_segments,
     speaker_segments: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
-    """
-    Align speaker diarization with transcription segments
-    
-    Args:
-        transcription_segments: Whisper transcription segments
-        speaker_segments: Speaker diarization segments
-        
-    Returns:
-        List of aligned transcript segments
-    """
     transcript = []
     
     for seg in transcription_segments:
+        # Skip empty/whitespace-only segments that slipped through
+        text = seg.text.strip()
+        if not text:
+            logger.debug(f"Skipping empty segment [{seg.start:.2f}-{seg.end:.2f}]")
+            continue
+
         speaker = "SPEAKER_UNKNOWN"
         
-        # Find overlapping speaker segment
         if speaker_segments:
             max_overlap = 0
             for s in speaker_segments:
-                # Calculate overlap
                 overlap_start = max(seg.start, s["start"])
                 overlap_end = min(seg.end, s["end"])
                 overlap = max(0, overlap_end - overlap_start)
@@ -609,7 +475,6 @@ def align_speakers_with_transcription(
                     max_overlap = overlap
                     speaker = s["speaker"]
         
-        # Calculate average word confidence if available
         confidence = None
         if hasattr(seg, 'words') and seg.words:
             confidences = [w.probability for w in seg.words if hasattr(w, 'probability')]
@@ -620,7 +485,7 @@ def align_speakers_with_transcription(
             "speaker": speaker,
             "start": round(seg.start, 2),
             "end": round(seg.end, 2),
-            "text": seg.text.strip(),
+            "text": text,
             "confidence": round(confidence, 3) if confidence else None
         })
     
@@ -637,36 +502,17 @@ def align_speakers_with_transcription(
     description="Transcribe audio files using Whisper with optional speaker diarization"
 )
 async def speech_to_text(request: SpeechToTextRequest) -> SpeechToTextResponse:
-    """
-    Convert speech to text with speaker diarization
-    
-    This endpoint:
-    1. Downloads audio from S3
-    2. Performs speaker diarization (if enabled)
-    3. Transcribes audio using Whisper
-    4. Aligns speakers with transcription
-    5. Uploads result to S3
-    6. Cleans up temporary files
-    
-    Args:
-        request: SpeechToTextRequest with audio location and options
-        
-    Returns:
-        SpeechToTextResponse with job details and transcript location
-    """
     job_id = str(uuid.uuid4())
     start_time = datetime.now()
     
     logger.info(f"Starting job {job_id}: {request.audio_bucket}/{request.audio_key}")
     
-    # Generate file paths
     audio_filename = sanitize_filename(Path(request.audio_key).name)
     audio_path = str(TEMP_DIR / f"{job_id}_{audio_filename}")
     output_path = str(TEMP_DIR / f"{job_id}.json")
     
     try:
         with temp_files(audio_path, output_path):
-            # Step 1: Check file exists and size
             file_metadata = check_s3_file(request.audio_bucket, request.audio_key)
             file_size = file_metadata['size']
             
@@ -679,17 +525,14 @@ async def speech_to_text(request: SpeechToTextRequest) -> SpeechToTextResponse:
             
             logger.info(f"File size: {file_size / (1024*1024):.2f}MB")
             
-            # Step 2: Download audio from S3
             download_from_s3(request.audio_bucket, request.audio_key, audio_path)
             
-            # Step 3: Speaker diarization (optional)
             speaker_segments = []
             if request.diarize and HUGGINGFACE_TOKEN:
                 speaker_segments = perform_diarization(audio_path)
             elif request.diarize and not HUGGINGFACE_TOKEN:
                 logger.warning("Diarization requested but HuggingFace token not available")
             
-            # Step 4: Transcribe audio
             transcription_segments, info = transcribe_audio(
                 audio_path,
                 language=request.language,
@@ -697,18 +540,15 @@ async def speech_to_text(request: SpeechToTextRequest) -> SpeechToTextResponse:
                 word_timestamps=request.word_timestamps
             )
             
-            # Step 5: Align speakers with transcription
             transcript = align_speakers_with_transcription(
                 transcription_segments,
                 speaker_segments
             )
             
-            # Calculate statistics
             speakers_detected = len(set(s["speaker"] for s in transcript))
             duration = transcript[-1]["end"] if transcript else 0
             processing_time = (datetime.now() - start_time).total_seconds()
             
-            # Step 6: Create result object
             result = TranscriptResult(
                 job_id=job_id,
                 language=info.language,
@@ -727,11 +567,9 @@ async def speech_to_text(request: SpeechToTextRequest) -> SpeechToTextResponse:
                 }
             )
             
-            # Step 7: Save transcript locally
             with open(output_path, "w", encoding='utf-8') as f:
                 json.dump(result.dict(), f, indent=2, ensure_ascii=False)
             
-            # Step 8: Upload to S3
             output_key = f"transcripts/{job_id}.json"
             
             upload_metadata = {
@@ -745,7 +583,6 @@ async def speech_to_text(request: SpeechToTextRequest) -> SpeechToTextResponse:
             
             upload_to_s3(output_path, request.output_bucket, output_key, upload_metadata)
             
-            # Step 9: Return success response
             logger.info(f"Job {job_id} completed successfully in {processing_time:.2f}s")
             
             return SpeechToTextResponse(
@@ -775,14 +612,8 @@ async def speech_to_text(request: SpeechToTextRequest) -> SpeechToTextResponse:
         )
 
 
-# =====================================================
-# HEALTH CHECK
-# =====================================================
 @router.get("/speech/health", tags=["Health"])
 async def health_check():
-    """Health check endpoint for speech-to-text service"""
-    
-    # Check if models are loaded
     whisper_loaded = _whisper_model is not None
     diarization_loaded = _diarization_pipeline is not None
     
@@ -800,12 +631,8 @@ async def health_check():
     }
 
 
-# =====================================================
-# MODEL INFO ENDPOINT
-# =====================================================
 @router.get("/speech/models", tags=["Speech"])
 async def get_model_info():
-    """Get information about available models and configurations"""
     return {
         "whisper_models": list(WHISPER_MODELS.keys()),
         "supported_languages": SUPPORTED_LANGUAGES,

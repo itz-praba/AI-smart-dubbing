@@ -72,8 +72,9 @@ export default function Contact() {
           </p>
 
           <div className="space-y-3 text-gray-300">
-            <p>📧 support@dubai.ai</p>
-            <p>💼 sales@dubai.ai</p>
+            <p>📧 dineshprabakaran2509@gmail.com</p>
+            <p>💼 jeevanradhakrishnan3@gmail.com</p>
+            <p>💼 sravansai1927@gmail.com</p>
             <p>🌍 Available worldwide</p>
           </div>
         </div>

@@ -1,6 +1,7 @@
 import { Upload, Video } from "lucide-react";
 import { useRef, useState } from "react";
 import axios from "axios";
+import darkAlert from "../utils/sweetalert";
 
 const VIDEO_BUCKET = import.meta.env.VITE_AWS_S3_BUCKET_NAME;
 
@@ -24,6 +25,7 @@ export default function StartDubbing() {
   
   const languages = [
   { label: "English", value: "en" },
+  { label: "Tamil", value: "ta" },
   { label: "Spanish", value: "es" },
   { label: "French", value: "fr" },
   { label: "German", value: "de" },
@@ -82,6 +84,18 @@ const handleStartDubbing = async () => {
         whisper_model_size: "medium",
         diarize: true,
         enable_lip_sync: true,
+        video_codec: "copy",
+        audio_codec: "aac",
+        audio_bitrate: "192k",
+        enable_audio_mastering: true, 
+        enable_bgm_ducking: true, 
+        target_lufs: -16.0, 
+        target_true_peak: -1.5, 
+        dialogue_peak_db: -3.0, 
+        bgm_duck_db: -12.0, 
+        comp_threshold_db: -24.0, 
+        comp_ratio: 4.0, 
+        comp_makeup_db: 6.0,
       },
       {
         headers: {

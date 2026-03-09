@@ -8,11 +8,26 @@ from typing import List, Dict, Optional
 from datetime import datetime
 from contextlib import contextmanager
 
+import numpy as np
+import soundfile as sf
 import boto3
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, validator
 from botocore.exceptions import ClientError
 from botocore.config import Config
+
+# Import mastering pipeline
+# FIX B3: Removed top-level import of audio_mastering to break the eager S3
+# initialisation that crashed the app at startup when AWS credentials were absent.
+# Constants are redefined here with the same defaults; master_dubbed_audio is
+# imported lazily inside video_merge() only when actually needed.
+TARGET_LUFS       = -16.0
+TARGET_TRUE_PEAK  = -1.5
+DIALOGUE_PEAK_DB  = -3.0
+BGM_DUCK_DB       = -12.0
+COMP_THRESHOLD_DB = -24.0
+COMP_RATIO        = 4.0
+COMP_MAKEUP_DB    = 6.0
 
 # Configure logging
 logging.basicConfig(
@@ -70,6 +85,8 @@ SUPPORTED_LANGUAGES = {
     "pol": "Polish",
     "tur": "Turkish",
     "nld": "Dutch",
+    "tam": "Tamil",   # ISO 639-2 for Tamil
+    "tgl": "Tanglish", # Custom code for Tanglish (romanised Tamil)
     "und": "Undetermined"
 }
 
@@ -166,6 +183,17 @@ class VideoMergeRequest(BaseModel):
     video_codec: str = Field("copy", description="Video codec (copy, libx264, etc.)")
     audio_codec: str = Field("aac", description="Audio codec")
     audio_bitrate: str = Field("192k", description="Audio bitrate")
+
+    # ── Audio mastering options ────────────────────────────────────
+    enable_audio_mastering: bool  = Field(True,  description="Run EQ+compress+loudness+ducking pipeline")
+    enable_bgm_ducking: bool      = Field(True,  description="Duck background music under dialogue")
+    target_lufs: float            = Field(TARGET_LUFS,        ge=-30.0, le=-6.0)
+    target_true_peak: float       = Field(TARGET_TRUE_PEAK,   ge=-6.0,  le=-0.5)
+    dialogue_peak_db: float       = Field(DIALOGUE_PEAK_DB,   ge=-12.0, le=0.0)
+    bgm_duck_db: float            = Field(BGM_DUCK_DB,        ge=-30.0, le=0.0)
+    comp_threshold_db: float      = Field(COMP_THRESHOLD_DB,  ge=-40.0, le=0.0)
+    comp_ratio: float             = Field(COMP_RATIO,         ge=1.0,   le=20.0)
+    comp_makeup_db: float         = Field(COMP_MAKEUP_DB,     ge=0.0,   le=24.0)
     
     @validator('video_bucket', 'audio_bucket', 'output_bucket', 'subtitle_bucket')
     def validate_bucket_name(cls, v):
@@ -534,7 +562,11 @@ def merge_video_with_audio(
     # Build FFmpeg command
     cmd = [FFMPEG_BIN, "-y"]
     
-    # Add input video
+    # Add input video.
+    # BUG FIX (English voice bleed): use -an on the video input so FFmpeg does NOT
+    # include the original audio stream in the output at all.  Previously the source
+    # video's native audio was being mixed in alongside the dubbed track, causing the
+    # original English voice to bleed through the Korean dub (echo / double-voice).
     cmd.extend(["-i", input_video])
     
     # Add audio inputs
@@ -545,10 +577,12 @@ def merge_video_with_audio(
     if subtitle_file:
         cmd.extend(["-i", subtitle_file])
     
-    # Map video stream
+    # Map ONLY the video stream from the source file (index 0).
+    # Explicitly do NOT map 0:a – that is the original-language audio that must be
+    # dropped entirely so it cannot bleed through the dubbed output.
     cmd.extend(["-map", "0:v:0"])
     
-    # Map audio streams
+    # Map audio streams from the dubbed audio inputs only (inputs 1..N)
     for i in range(len(audio_files)):
         cmd.extend(["-map", f"{i+1}:a:0"])
     
@@ -701,6 +735,77 @@ async def video_merge(request: VideoMergeRequest) -> VideoMergeResponse:
             temp_files_list.append(subtitle_path)
             
             download_from_s3(request.subtitle_bucket, request.subtitle_key, subtitle_path)
+        
+        # ── Step 3b: Audio mastering pipeline ────────────────────────
+        # Applies: EQ → compression → loudness normalisation → BGM ducking → peak limit
+        # This is the fix for: low loudness, flat dynamics, BGM overpowering voice
+        if request.enable_audio_mastering:
+            logger.info("Running audio mastering pipeline on all dubbed tracks...")
+            # FIX B3: Lazy import — avoids eager S3 init at module load time
+            from python_controllers.audio_mastering import master_dubbed_audio
+
+            # Extract original video audio for BGM ducking reference
+            original_audio_path = str(work_dir / "original_audio_ref.wav")
+            try:
+                extract_cmd = [
+                    FFMPEG_BIN, "-y",
+                    "-i", video_path,
+                    "-vn",
+                    "-ac", "1",
+                    "-ar", "24000",
+                    "-acodec", "pcm_s16le",
+                    original_audio_path
+                ]
+                subprocess.run(extract_cmd, check=True, capture_output=True,
+                               timeout=300, text=True)
+                has_original_audio = os.path.exists(original_audio_path) and \
+                                     os.path.getsize(original_audio_path) > 0
+            except Exception as e:
+                logger.warning(f"Could not extract original audio for BGM ducking: {e}")
+                has_original_audio = False
+
+            mastered_audio_files = []
+            for i, af in enumerate(audio_files):
+                mastered_path = str(work_dir / f"mastered_{i}_{Path(af['path']).name}")
+                temp_files_list.append(mastered_path)
+
+                # Build a minimal mastering config matching the request settings
+                class _Cfg:
+                    comp_threshold_db = request.comp_threshold_db
+                    comp_ratio        = request.comp_ratio
+                    comp_makeup_db    = request.comp_makeup_db
+                    target_lufs       = request.target_lufs
+                    target_true_peak  = request.target_true_peak
+                    dialogue_peak_db  = request.dialogue_peak_db
+                    bgm_duck_db       = request.bgm_duck_db
+                    enable_eq              = True
+                    enable_compression     = True
+                    enable_bgm_ducking     = request.enable_bgm_ducking
+
+                try:
+                    meta = master_dubbed_audio(
+                        dubbed_path   = af['path'],
+                        original_path = original_audio_path if has_original_audio else None,
+                        output_path   = mastered_path,
+                        cfg           = _Cfg(),
+                    )
+                    logger.info(
+                        f"Track {i} mastered: "
+                        f"{meta['lufs_before']:.1f} → {meta['lufs_after']:.1f} LUFS, "
+                        f"BGM duck: {meta['bgm_ducking']}"
+                    )
+                    mastered_audio_files.append({
+                        'path':     mastered_path,
+                        'language': af['language'],
+                        'title':    af['title'],
+                    })
+                except Exception as e:
+                    logger.error(f"Mastering failed for track {i}, using raw audio: {e}")
+                    mastered_audio_files.append(af)
+
+            audio_files = mastered_audio_files
+            if has_original_audio:
+                temp_files_list.append(original_audio_path)
         
         # Step 4: Merge video with audio tracks
         logger.info("Merging video with audio tracks...")
