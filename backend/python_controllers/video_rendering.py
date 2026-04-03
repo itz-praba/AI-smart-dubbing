@@ -8,11 +8,26 @@ from typing import List, Dict, Optional
 from datetime import datetime
 from contextlib import contextmanager
 
+import numpy as np
+import soundfile as sf
 import boto3
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, validator
 from botocore.exceptions import ClientError
 from botocore.config import Config
+
+# Import mastering pipeline
+# FIX B3: Removed top-level import of audio_mastering to break the eager S3
+# initialisation that crashed the app at startup when AWS credentials were absent.
+# Constants are redefined here with the same defaults; master_dubbed_audio is
+# imported lazily inside video_merge() only when actually needed.
+TARGET_LUFS       = -16.0
+TARGET_TRUE_PEAK  = -1.5
+DIALOGUE_PEAK_DB  = -3.0
+BGM_DUCK_DB       = -12.0
+COMP_THRESHOLD_DB = -24.0
+COMP_RATIO        = 4.0
+COMP_MAKEUP_DB    = 6.0
 
 # Configure logging
 logging.basicConfig(
@@ -70,6 +85,20 @@ SUPPORTED_LANGUAGES = {
     "pol": "Polish",
     "tur": "Turkish",
     "nld": "Dutch",
+    "ukr": "Ukrainian",   # BUG FIX 7 — was missing
+    "vie": "Vietnamese",  # BUG FIX 7 — was missing
+    "ces": "Czech",       # BUG FIX 7 — was missing
+    "dan": "Danish",      # BUG FIX 7 — was missing
+    "fin": "Finnish",     # BUG FIX 7 — was missing
+    "nor": "Norwegian",   # BUG FIX 7 — was missing
+    "swe": "Swedish",     # BUG FIX 7 — was missing
+    "ell": "Greek",       # BUG FIX 7 — was missing
+    "heb": "Hebrew",      # BUG FIX 7 — was missing
+    "tha": "Thai",        # BUG FIX 7 — was missing
+    "tam": "Tamil",
+    "tel": "Telugu",      # BUG FIX 7 — was missing
+    "urd": "Urdu",        # BUG FIX 7 — was missing
+    "tgl": "Tanglish",
     "und": "Undetermined"
 }
 
@@ -166,6 +195,17 @@ class VideoMergeRequest(BaseModel):
     video_codec: str = Field("copy", description="Video codec (copy, libx264, etc.)")
     audio_codec: str = Field("aac", description="Audio codec")
     audio_bitrate: str = Field("192k", description="Audio bitrate")
+
+    # ── Audio mastering options ────────────────────────────────────
+    enable_audio_mastering: bool  = Field(True,  description="Run EQ+compress+loudness+ducking pipeline")
+    enable_bgm_ducking: bool      = Field(True,  description="Duck background music under dialogue")
+    target_lufs: float            = Field(TARGET_LUFS,        ge=-30.0, le=-6.0)
+    target_true_peak: float       = Field(TARGET_TRUE_PEAK,   ge=-6.0,  le=-0.5)
+    dialogue_peak_db: float       = Field(DIALOGUE_PEAK_DB,   ge=-12.0, le=0.0)
+    bgm_duck_db: float            = Field(BGM_DUCK_DB,        ge=-30.0, le=0.0)
+    comp_threshold_db: float      = Field(COMP_THRESHOLD_DB,  ge=-40.0, le=0.0)
+    comp_ratio: float             = Field(COMP_RATIO,         ge=1.0,   le=20.0)
+    comp_makeup_db: float         = Field(COMP_MAKEUP_DB,     ge=0.0,   le=24.0)
     
     @validator('video_bucket', 'audio_bucket', 'output_bucket', 'subtitle_bucket')
     def validate_bucket_name(cls, v):
@@ -490,6 +530,83 @@ def get_video_info(video_path: str) -> Dict:
         return {'duration': 0, 'size': 0, 'width': 0, 'height': 0, 'video_codec': 'unknown'}
 
 
+def _get_media_duration(path: str) -> float:
+    """Return duration in seconds of any audio or video file via ffprobe."""
+    try:
+        result = subprocess.run(
+            [
+                FFPROBE_BIN, "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path
+            ],
+            capture_output=True, text=True, timeout=30, check=True
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+def _pad_or_trim_audio(audio_path: str, target_duration: float, work_dir: Path) -> str:
+    """
+    BUG FIX 5 — Audio/video duration mismatch:
+    Ensure the dubbed audio track is exactly `target_duration` seconds long
+    before muxing, so the final video never ends with silence or gets cut short.
+
+    Strategy:
+      • audio shorter than video → pad with silence using ffmpeg apad filter
+      • audio longer  than video → trim with ffmpeg atrim filter
+      • within 50ms tolerance    → use as-is (avoids unnecessary re-encode)
+
+    Returns the path of the duration-matched audio (may be the original path
+    if no adjustment was needed).
+    """
+    audio_dur = _get_media_duration(audio_path)
+    if audio_dur <= 0:
+        logger.warning(f"Could not determine audio duration for {audio_path}; skipping adjustment")
+        return audio_path
+
+    diff = abs(audio_dur - target_duration)
+    if diff < 0.05:
+        logger.debug(f"Audio duration {audio_dur:.3f}s within 50ms of video {target_duration:.3f}s; no adjustment")
+        return audio_path
+
+    out_path = str(work_dir / f"dur_fixed_{Path(audio_path).name}")
+
+    if audio_dur < target_duration:
+        # Pad with silence to reach target duration
+        logger.info(
+            f"Audio ({audio_dur:.2f}s) shorter than video ({target_duration:.2f}s); "
+            f"padding {target_duration - audio_dur:.2f}s of silence"
+        )
+        af = f"apad=pad_dur={target_duration - audio_dur:.6f}"
+        trim_args: List[str] = []
+    else:
+        # Trim audio to video length
+        logger.info(
+            f"Audio ({audio_dur:.2f}s) longer than video ({target_duration:.2f}s); "
+            f"trimming {audio_dur - target_duration:.2f}s"
+        )
+        af = f"atrim=end={target_duration:.6f}"
+        trim_args = []
+
+    cmd = [
+        FFMPEG_BIN, "-y",
+        "-i", audio_path,
+        "-af", af,
+        "-ar", "24000", "-ac", "1",
+        "-c:a", "pcm_s16le",
+        out_path
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
+        logger.info(f"Duration-adjusted audio written to {out_path}")
+        return out_path
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"Audio duration adjustment failed ({e.stderr[:200]}); using original")
+        return audio_path
+
+
 def merge_video_with_audio(
     input_video: str,
     audio_files: List[Dict[str, str]],
@@ -497,102 +614,122 @@ def merge_video_with_audio(
     subtitle_file: Optional[str] = None,
     video_codec: str = "copy",
     audio_codec: str = "aac",
-    audio_bitrate: str = "192k"
+    audio_bitrate: str = "192k",
+    work_dir: Optional[Path] = None,
 ) -> None:
     """
-    Merge video with multiple audio tracks and optional subtitles
-    
-    Args:
-        input_video: Path to input video
-        audio_files: List of audio file dicts with 'path', 'language', 'title'
-        output_video: Path to output video
-        subtitle_file: Optional path to subtitle file
-        video_codec: Video codec (default: copy)
-        audio_codec: Audio codec (default: aac)
-        audio_bitrate: Audio bitrate (default: 192k)
+    Merge video with multiple audio tracks and optional subtitles.
+
+    BUG FIX 5 — Duration mismatch: each audio track is padded or trimmed to
+    exactly match the video duration before muxing.
+
+    BUG FIX 6 — video_codec="copy" breaks when audio stream count changes:
+    "copy" re-muxes the raw video bitstream unchanged. This is fast and lossless
+    but causes container-level errors on some players when the audio layout in the
+    output differs from what was encoded into the original container header.
+    We keep "copy" as the default for performance but automatically fall back to
+    "libx264" (with -crf 18 to be visually lossless) if the copy mux fails, rather
+    than surfacing a confusing FFmpeg error to the caller.
     """
-    # Validate input files exist
     if not os.path.exists(input_video):
-        raise HTTPException(
-            status_code=500,
-            detail="Input video file not found"
-        )
-    
+        raise HTTPException(status_code=500, detail="Input video file not found")
+
     for audio in audio_files:
         if not os.path.exists(audio['path']):
-            raise HTTPException(
-                status_code=500,
-                detail=f"Audio file not found: {audio['path']}"
-            )
-    
+            raise HTTPException(status_code=500, detail=f"Audio file not found: {audio['path']}")
+
     if subtitle_file and not os.path.exists(subtitle_file):
-        raise HTTPException(
-            status_code=500,
-            detail="Subtitle file not found"
-        )
-    
-    # Build FFmpeg command
-    cmd = [FFMPEG_BIN, "-y"]
-    
-    # Add input video
-    cmd.extend(["-i", input_video])
-    
-    # Add audio inputs
-    for audio in audio_files:
-        cmd.extend(["-i", audio['path']])
-    
-    # Add subtitle input
-    if subtitle_file:
-        cmd.extend(["-i", subtitle_file])
-    
-    # Map video stream
-    cmd.extend(["-map", "0:v:0"])
-    
-    # Map audio streams
-    for i in range(len(audio_files)):
-        cmd.extend(["-map", f"{i+1}:a:0"])
-    
-    # Map subtitle stream
-    if subtitle_file:
-        subtitle_index = len(audio_files) + 1
-        cmd.extend(["-map", f"{subtitle_index}:s:0"])
-    
-    # Set codecs
-    cmd.extend([
-        "-c:v", video_codec,
-        "-c:a", audio_codec,
-        "-b:a", audio_bitrate
-    ])
-    
-    # Set subtitle codec
-    if subtitle_file:
-        cmd.extend(["-c:s", "mov_text"])
-    
-    # Add metadata for audio tracks
-    for i, audio in enumerate(audio_files):
-        cmd.extend([
-            f"-metadata:s:a:{i}", f"language={audio['language']}",
-            f"-metadata:s:a:{i}", f"title={audio['title']}"
-        ])
-    
-    # Output file
-    cmd.append(output_video)
-    
-    # Run command
-    run_ffmpeg_command(cmd)
-    
-    # Verify output
+        raise HTTPException(status_code=500, detail="Subtitle file not found")
+
+    # BUG FIX 5: pad/trim each audio track to exactly match video duration
+    video_dur = _get_media_duration(input_video)
+    if video_dur > 0 and work_dir is not None:
+        adjusted_audio_files = []
+        for af in audio_files:
+            fixed_path = _pad_or_trim_audio(af['path'], video_dur, work_dir)
+            adjusted_audio_files.append({**af, 'path': fixed_path})
+        audio_files = adjusted_audio_files
+
+    def _build_cmd(v_codec: str) -> List[str]:
+        cmd = [FFMPEG_BIN, "-y"]
+
+        # ── ROOT CAUSE 1 FIX: -an on the video input ─────────────────────────
+        # Without -an, FFmpeg copies the moov atom from the source container,
+        # which still declares the original audio stream. Players that parse the
+        # container header (VLC, QuickTime, Android MediaPlayer) auto-select
+        # stream 0:a:0 — the original language audio — even when it was not
+        # mapped into the output, causing the original voice to bleed through
+        # the dubbed track as a faint background echo.
+        # -an on the INPUT (not the output) tells FFmpeg to treat the source as
+        # video-only before mapping, so the original audio stream is never
+        # carried into the output container at all.
+        cmd.extend(["-an", "-i", input_video])
+
+        for audio in audio_files:
+            cmd.extend(["-i", audio['path']])
+        if subtitle_file:
+            cmd.extend(["-i", subtitle_file])
+
+        # ── ROOT CAUSE 2 FIX: explicit negative audio map ────────────────────
+        # Belt-and-suspenders: even with -an on the input, explicitly block
+        # any accidental inclusion of stream 0's audio. -map -0:a means
+        # "never include any audio from input 0, period."
+        cmd.extend(["-map", "0:v:0"])
+        cmd.extend(["-map", "-0:a"])   # ROOT CAUSE 2: hard block original audio
+
+        for i in range(len(audio_files)):
+            cmd.extend(["-map", f"{i+1}:a:0"])
+        if subtitle_file:
+            cmd.extend(["-map", f"{len(audio_files)+1}:s:0"])
+
+        cmd.extend(["-c:v", v_codec])
+        if v_codec != "copy":
+            cmd.extend(["-crf", "18", "-preset", "fast"])
+        cmd.extend(["-c:a", audio_codec, "-b:a", audio_bitrate])
+        if subtitle_file:
+            cmd.extend(["-c:s", "mov_text"])
+
+        # ── ROOT CAUSE 4 FIX: set stream dispositions explicitly ─────────────
+        # Mark the dubbed audio track as the default so every player picks it.
+        # Without this, players that can't parse language metadata fall back to
+        # stream index order and may find a lingering original audio stream.
+        for i, audio in enumerate(audio_files):
+            cmd.extend([
+                f"-metadata:s:a:{i}", f"language={audio['language']}",
+                f"-metadata:s:a:{i}", f"title={audio['title']}",
+                f"-disposition:a:{i}", "default" if i == 0 else "none",
+            ])
+
+        # -movflags +faststart: write moov atom at the front of the file.
+        # This also forces FFmpeg to re-write the container header cleanly,
+        # removing any stale stream references from the source container.
+        cmd.extend(["-movflags", "+faststart"])
+
+        if video_dur > 0:
+            cmd.extend(["-t", f"{video_dur:.6f}"])
+
+        cmd.append(output_video)
+        return cmd
+
+    # BUG FIX 6: try copy first; fall back to libx264 on container error
+    try:
+        run_ffmpeg_command(_build_cmd(video_codec))
+    except HTTPException as first_err:
+        if video_codec == "copy":
+            logger.warning(
+                f"video_codec=copy failed ({first_err.detail[:120]}); "
+                f"retrying with libx264 (crf=18)"
+            )
+            if os.path.exists(output_video):
+                os.remove(output_video)
+            run_ffmpeg_command(_build_cmd("libx264"))
+        else:
+            raise
+
     if not os.path.exists(output_video):
-        raise HTTPException(
-            status_code=500,
-            detail="FFmpeg completed but output file not found"
-        )
-    
+        raise HTTPException(status_code=500, detail="FFmpeg completed but output file not found")
     if os.path.getsize(output_video) == 0:
-        raise HTTPException(
-            status_code=500,
-            detail="FFmpeg produced empty output file"
-        )
+        raise HTTPException(status_code=500, detail="FFmpeg produced empty output file")
 
 
 # =====================================================
@@ -692,6 +829,8 @@ async def video_merge(request: VideoMergeRequest) -> VideoMergeResponse:
             logger.info(f"Downloaded audio track {i}: {track.title} ({track.language})")
         
         # Step 3: Download subtitles (optional)
+        # BUG FIX 9: initialise subtitle_path to None here so merge_video_with_audio
+        # always receives a defined value even when no subtitle_key is provided.
         subtitle_path = None
         if request.subtitle_key and request.subtitle_bucket:
             logger.info("Downloading subtitles...")
@@ -701,6 +840,83 @@ async def video_merge(request: VideoMergeRequest) -> VideoMergeResponse:
             temp_files_list.append(subtitle_path)
             
             download_from_s3(request.subtitle_bucket, request.subtitle_key, subtitle_path)
+        
+        # ── Step 3b: Audio mastering pipeline ────────────────────────
+        if request.enable_audio_mastering:
+            logger.info("Running audio mastering pipeline on all dubbed tracks...")
+            from python_controllers.audio_mastering import master_dubbed_audio
+
+            # Extract original video audio for BGM DUCKING REFERENCE ONLY.
+            # ROOT CAUSE 3 FIX: this WAV is used purely as a sidechain signal
+            # for the compressor/ducker — it must NEVER be mixed into the
+            # dubbed output. master_dubbed_audio receives it as `original_path`
+            # which is only read for RMS analysis. If your audio_mastering
+            # implementation mixes or adds this signal, that is the source of
+            # the original-voice bleed — it must only compute gain curves from
+            # it, not concatenate or amix it with the dubbed track.
+            original_audio_path = str(work_dir / "original_audio_ref.wav")
+            try:
+                extract_cmd = [
+                    FFMPEG_BIN, "-y",
+                    "-i", video_path,
+                    "-vn",           # video-only input → extract audio
+                    "-ac", "1",
+                    "-ar", "24000",
+                    "-acodec", "pcm_s16le",
+                    original_audio_path
+                ]
+                subprocess.run(extract_cmd, check=True, capture_output=True,
+                               timeout=300, text=True)
+                has_original_audio = (
+                    os.path.exists(original_audio_path) and
+                    os.path.getsize(original_audio_path) > 0
+                )
+            except Exception as e:
+                logger.warning(f"Could not extract original audio for BGM ducking: {e}")
+                has_original_audio = False
+
+            mastered_audio_files = []
+            for i, af in enumerate(audio_files):
+                mastered_path = str(work_dir / f"mastered_{i}_{Path(af['path']).name}")
+                temp_files_list.append(mastered_path)
+
+                # Build a minimal mastering config matching the request settings
+                class _Cfg:
+                    comp_threshold_db = request.comp_threshold_db
+                    comp_ratio        = request.comp_ratio
+                    comp_makeup_db    = request.comp_makeup_db
+                    target_lufs       = request.target_lufs
+                    target_true_peak  = request.target_true_peak
+                    dialogue_peak_db  = request.dialogue_peak_db
+                    bgm_duck_db       = request.bgm_duck_db
+                    enable_eq              = True
+                    enable_compression     = True
+                    enable_bgm_ducking     = request.enable_bgm_ducking
+
+                try:
+                    meta = master_dubbed_audio(
+                        dubbed_path   = af['path'],
+                        original_path = original_audio_path if has_original_audio else None,
+                        output_path   = mastered_path,
+                        cfg           = _Cfg(),
+                    )
+                    logger.info(
+                        f"Track {i} mastered: "
+                        f"{meta['lufs_before']:.1f} → {meta['lufs_after']:.1f} LUFS, "
+                        f"BGM duck: {meta['bgm_ducking']}"
+                    )
+                    mastered_audio_files.append({
+                        'path':     mastered_path,
+                        'language': af['language'],
+                        'title':    af['title'],
+                    })
+                except Exception as e:
+                    logger.error(f"Mastering failed for track {i}, using raw audio: {e}")
+                    mastered_audio_files.append(af)
+
+            audio_files = mastered_audio_files
+            if has_original_audio:
+                temp_files_list.append(original_audio_path)
         
         # Step 4: Merge video with audio tracks
         logger.info("Merging video with audio tracks...")
@@ -715,7 +931,8 @@ async def video_merge(request: VideoMergeRequest) -> VideoMergeResponse:
             subtitle_file=subtitle_path,
             video_codec=request.video_codec,
             audio_codec=request.audio_codec,
-            audio_bitrate=request.audio_bitrate
+            audio_bitrate=request.audio_bitrate,
+            work_dir=work_dir,   # BUG FIX 5: enables per-track duration adjustment
         )
         
         # Get output file size
@@ -771,20 +988,14 @@ async def video_merge(request: VideoMergeRequest) -> VideoMergeResponse:
         )
     
     finally:
-        # Cleanup
-        for file_path in temp_files_list:
-            try:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-            except OSError as e:
-                logger.warning(f"Failed to clean up {file_path}: {e}")
-        
-        # Remove work directory
+        # BUG FIX 8: use shutil.rmtree instead of os.rmdir so the work directory
+        # is always cleaned up even when temp files remain (e.g. on FFmpeg failure).
+        # rmdir raises OSError if the directory is non-empty; rmtree does not.
         try:
             if work_dir.exists():
-                work_dir.rmdir()
-        except OSError:
-            pass
+                shutil.rmtree(work_dir, ignore_errors=True)
+        except Exception as e:
+            logger.warning(f"Failed to clean up work directory {work_dir}: {e}")
 
 
 # =====================================================

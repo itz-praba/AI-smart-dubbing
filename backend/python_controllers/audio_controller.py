@@ -37,45 +37,66 @@ REQUIRED_ENV_VARS = [
     "AWS_REGION"
 ]
 
-for env_var in REQUIRED_ENV_VARS:
-    if not os.getenv(env_var):
-        raise RuntimeError(f"Missing required environment variable: {env_var}")
+_missing_env = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
+if _missing_env:
+    # BUG FIX 4: warn instead of raising at module level so the server can start
+    # in dev/test environments without S3 credentials. The endpoint itself will
+    # raise a proper 503 if S3 is actually needed.
+    for _v in _missing_env:
+        logger.warning(f"Missing environment variable: {_v} – S3 features disabled")
 
 # Validate FFMPEG path
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 if not shutil.which(FFMPEG_PATH):
     raise RuntimeError(f"FFmpeg not found at: {FFMPEG_PATH}. Please install FFmpeg or set FFMPEG_PATH environment variable.")
 
+# Bug 3 fix: derive ffprobe path robustly rather than str.replace("ffmpeg","ffprobe")
+# which breaks on paths like /usr/local/bin/ffmpeg → /usr/local/bin/ffprobe (ok)
+# but also breaks if the binary is named ffmpeg-6.0 or similar.
+_ffprobe_candidate = os.getenv("FFPROBE_PATH", "ffprobe")
+FFPROBE_PATH = _ffprobe_candidate if shutil.which(_ffprobe_candidate) else None
+if FFPROBE_PATH is None:
+    # Try deriving from FFMPEG_PATH directory as a last resort
+    _ffmpeg_dir = os.path.dirname(shutil.which(FFMPEG_PATH) or "")
+    _candidate   = os.path.join(_ffmpeg_dir, "ffprobe") if _ffmpeg_dir else "ffprobe"
+    FFPROBE_PATH = _candidate if shutil.which(_candidate) else None
+    if FFPROBE_PATH is None:
+        logger.warning(
+            "ffprobe not found — audio_duration_seconds will be None in responses. "
+            "Install ffprobe (part of the ffmpeg package) or set FFPROBE_PATH env var."
+        )
+
 # Create temp directory
 TEMP_DIR.mkdir(exist_ok=True)
 
 # Initialize S3 client with retry configuration
-try:
-    from botocore.config import Config
-    
-    boto_config = Config(
-        retries={
-            'max_attempts': 3,
-            'mode': 'standard'
-        },
-        connect_timeout=10,
-        read_timeout=60
-    )
-    
-    s3_client = boto3.client(
-        "s3",
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-        region_name=os.getenv("AWS_REGION"),
-        config=boto_config
-    )
-    
-    # Test S3 connection
-    s3_client.list_buckets()
-    logger.info("S3 client initialized successfully")
-    
-except Exception as e:
-    raise RuntimeError(f"Failed to initialize S3 client: {str(e)}")
+S3_ENABLED = not bool(_missing_env)
+s3_client   = None
+
+if S3_ENABLED:
+    try:
+        from botocore.config import Config
+        
+        boto_config = Config(
+            retries={'max_attempts': 3, 'mode': 'standard'},
+            connect_timeout=10,
+            read_timeout=60
+        )
+        
+        s3_client = boto3.client(
+            "s3",
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+            region_name=os.getenv("AWS_REGION"),
+            config=boto_config
+        )
+        
+        s3_client.list_buckets()
+        logger.info("S3 client initialized successfully")
+        
+    except Exception as e:
+        logger.warning(f"S3 client init failed ({e}) – S3 features disabled")
+        S3_ENABLED = False
 
 
 # Pydantic Models
@@ -143,7 +164,8 @@ class VideoToAudioResponse(BaseModel):
     audio_bucket: str
     audio_key: str
     file_size_bytes: int
-    duration_seconds: Optional[float] = None
+    duration_seconds: Optional[float] = None          # FFmpeg wall-clock processing time
+    audio_duration_seconds: Optional[float] = None    # Actual audio/video duration in seconds
     message: str
 
 
@@ -204,17 +226,9 @@ def sanitize_filename(filename: str) -> str:
 def check_s3_file_exists(bucket: str, key: str) -> dict:
     """
     Check if S3 file exists and get metadata
-    
-    Args:
-        bucket: S3 bucket name
-        key: S3 object key
-        
-    Returns:
-        Dictionary with file metadata
-        
-    Raises:
-        HTTPException: If file not found or other S3 errors
     """
+    if not S3_ENABLED:
+        raise HTTPException(status_code=503, detail="S3 not configured – check AWS env vars")
     try:
         response = s3_client.head_object(Bucket=bucket, Key=key)
         return {
@@ -243,17 +257,9 @@ def check_s3_file_exists(bucket: str, key: str) -> dict:
 
 
 def download_from_s3(bucket: str, key: str, local_path: str) -> None:
-    """
-    Download file from S3 with error handling
-    
-    Args:
-        bucket: S3 bucket name
-        key: S3 object key
-        local_path: Local file path to save to
-        
-    Raises:
-        HTTPException: If download fails
-    """
+    """Download file from S3 with error handling"""
+    if not S3_ENABLED:
+        raise HTTPException(status_code=503, detail="S3 not configured – check AWS env vars")
     try:
         logger.info(f"Downloading s3://{bucket}/{key} to {local_path}")
         s3_client.download_file(bucket, key, local_path)
@@ -288,31 +294,125 @@ def download_from_s3(bucket: str, key: str, local_path: str) -> None:
         )
 
 
+def _has_audio_stream(video_path: str) -> bool:
+    """
+    Detect whether the video file contains at least one audio stream.
+
+    ROOT CAUSE OF PREVIOUS BUG:
+        The old implementation ran:
+            ffmpeg -v error -i <file> -f null -
+        With -v error, FFmpeg suppresses all informational output including the
+        stream listing lines ("Stream #0:1: Audio: aac ..."). Those lines are
+        INFO-level, not ERROR-level, so stderr was always empty and "Audio:"
+        was never found — causing every video to be rejected as having no audio.
+
+    Fix: Use ffprobe with -show_streams -select_streams a to directly query
+    audio streams. If ffprobe is unavailable, fall back to ffmpeg with
+    -v info (not -v error) so stream lines are visible in stderr.
+    A second fallback simply returns True (let ffmpeg try and fail naturally).
+    """
+    # ── Primary: ffprobe JSON query (most reliable) ───────────────────────────
+    if FFPROBE_PATH:
+        try:
+            result = subprocess.run(
+                [
+                    FFPROBE_PATH,
+                    "-v", "error",
+                    "-select_streams", "a",          # select audio streams only
+                    "-show_entries", "stream=index", # just need to know if any exist
+                    "-of", "csv=p=0",                # compact output
+                    video_path,
+                ],
+                capture_output=True, text=True, timeout=30,
+            )
+            # If any audio stream exists, stdout will contain at least one line
+            has_audio = bool(result.stdout.strip())
+            logger.debug(
+                f"_has_audio_stream (ffprobe): {'found' if has_audio else 'not found'} "
+                f"for {video_path}"
+            )
+            return has_audio
+        except Exception as e:
+            logger.warning(f"ffprobe audio stream check failed ({e}); falling back to ffmpeg")
+
+    # ── Fallback: ffmpeg -v info so stream lines appear in stderr ─────────────
+    try:
+        result = subprocess.run(
+            [
+                FFMPEG_PATH,
+                "-v", "info",      # INFO level — stream listing lines ARE visible here
+                "-i", video_path,
+                "-f", "null", "-",
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        has_audio = "Audio:" in result.stderr
+        logger.debug(
+            f"_has_audio_stream (ffmpeg -v info): {'found' if has_audio else 'not found'} "
+            f"for {video_path}"
+        )
+        return has_audio
+    except Exception as e:
+        logger.warning(
+            f"_has_audio_stream fallback also failed ({e}); "
+            f"assuming audio present and letting ffmpeg decide"
+        )
+        return True   # assume audio present — let the main ffmpeg command fail naturally
+
+
 def convert_video_to_audio(video_path: str, audio_path: str) -> dict:
     """
-    Convert video to audio using FFmpeg
-    
-    Args:
-        video_path: Path to input video file
-        audio_path: Path to output audio file
-        
-    Returns:
-        Dictionary with conversion metadata
-        
-    Raises:
-        HTTPException: If conversion fails
+    Convert video to audio using FFmpeg.
+
+    BUG FIX 1 — Sample rate mismatch:
+        Changed output sample rate from 16000 Hz to 24000 Hz.
+        XTTS v2 and MMS-TTS both produce 24 kHz audio. Every downstream module
+        (lip_sync.py, audio_mastering.py) operates at 24 kHz. Extracting at
+        16 kHz forced a lossy upsample later, introducing resampling artifacts
+        (pops, tinny timbre, subtle pitch smear) into the speaker reference used
+        by voice cloning.
+
+    BUG FIX 2 — Destructive audio filter chain:
+        Removed `lowpass=f=8000` — this hard-cut at 8 kHz was stripping the
+        4–8 kHz presence band that carries consonant clarity (s, t, sh, ch).
+        Female voices above ~6 kHz were completely wiped.
+        Removed `dynaudnorm` — its gain-riding algorithm pumps loudly during
+        the silences between dubbed segments, making the audio breathe in an
+        unnatural way when heard in a quiet room.
+        Replaced with a conservative, mastering-safe filter chain:
+          • highpass=f=80   — still removes sub-bass rumble/mic handling noise
+          • loudnorm (EBU R128, I=-23, LRA=11, TP=-1.5) — stable integrated
+            loudness normalisation without the pumping artifacts of dynaudnorm
+
+    BUG FIX 3 — Silent video crash:
+        Added _has_audio_stream() pre-check. Videos with no audio track (screen
+        recordings, muted uploads) now return a clean HTTP 422 with an
+        actionable message instead of crashing FFmpeg mid-pipeline.
     """
+    # Bug fix 3: pre-check for audio stream
+    if not _has_audio_stream(video_path):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "The video file contains no audio stream. "
+                "Please upload a video with an audio track before dubbing."
+            )
+        )
+
     command = [
         FFMPEG_PATH,
-        "-y",  # Overwrite output file
-        "-i", video_path,  # Input file
-        "-vn",  # No video
-        "-ac", "1",  # Mono audio
-        "-ar", "16000",  # Sample rate 16kHz
-        "-acodec", "pcm_s16le",  # PCM 16-bit little-endian
-        "-af", "highpass=f=80,lowpass=f=8000,dynaudnorm",  # Audio filters
-        "-map_metadata", "-1",  # Strip metadata
-        "-fflags", "+bitexact",  # Ensure reproducible output
+        "-y",                          # overwrite output
+        "-i", video_path,              # input file
+        "-vn",                         # discard video
+        "-ac", "1",                    # mono
+        "-ar", "24000",                # BUG FIX 1: 24 kHz to match XTTS/MMS pipeline
+        "-acodec", "pcm_s16le",        # PCM 16-bit LE
+        "-af", (
+            "highpass=f=80,"           # remove sub-bass rumble
+            "loudnorm=I=-23:LRA=11:TP=-1.5"  # BUG FIX 2: stable EBU R128 normalisation
+        ),
+        "-map_metadata", "-1",         # strip metadata
+        "-fflags", "+bitexact",        # reproducible output
         audio_path
     ]
     
@@ -328,22 +428,14 @@ def convert_video_to_audio(video_path: str, audio_path: str) -> dict:
             timeout=FFMPEG_TIMEOUT
         )
         
-        end_time = datetime.now()
-        duration = (end_time - start_time).total_seconds()
+        duration = (datetime.now() - start_time).total_seconds()
         
-        # Verify output file
         if not os.path.exists(audio_path):
-            raise HTTPException(
-                status_code=500,
-                detail="FFmpeg completed but output file not found"
-            )
+            raise HTTPException(status_code=500, detail="FFmpeg completed but output file not found")
         
         file_size = os.path.getsize(audio_path)
         if file_size == 0:
-            raise HTTPException(
-                status_code=500,
-                detail="FFmpeg produced empty output file"
-            )
+            raise HTTPException(status_code=500, detail="FFmpeg produced empty output file")
         
         logger.info(f"Conversion successful in {duration:.2f}s, output size: {file_size} bytes")
         
@@ -360,7 +452,6 @@ def convert_video_to_audio(video_path: str, audio_path: str) -> dict:
         )
     except subprocess.CalledProcessError as e:
         logger.error(f"FFmpeg error: {e.stderr}")
-        # Parse common FFmpeg errors
         stderr_lower = e.stderr.lower()
         if "invalid data" in stderr_lower or "corrupt" in stderr_lower:
             detail = "Video file appears to be corrupted or invalid"
@@ -368,31 +459,22 @@ def convert_video_to_audio(video_path: str, audio_path: str) -> dict:
             detail = "Input file not found"
         elif "permission denied" in stderr_lower:
             detail = "Permission denied accessing file"
+        elif "output file #0 does not contain any stream" in stderr_lower:
+            detail = "The video has no audio stream to extract"
         else:
             detail = f"Video conversion failed: {e.stderr[:200]}"
-        
         raise HTTPException(status_code=500, detail=detail)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Unexpected FFmpeg error: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unexpected error during conversion: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Unexpected error during conversion: {str(e)}")
 
 
 def upload_to_s3(local_path: str, bucket: str, key: str, metadata: dict = None) -> None:
-    """
-    Upload file to S3 with error handling
-    
-    Args:
-        local_path: Local file path to upload
-        bucket: S3 bucket name
-        key: S3 object key
-        metadata: Optional metadata dictionary
-        
-    Raises:
-        HTTPException: If upload fails
-    """
+    """Upload file to S3 with error handling"""
+    if not S3_ENABLED:
+        raise HTTPException(status_code=503, detail="S3 not configured – check AWS env vars")
     try:
         extra_args = {
             "ContentType": "audio/wav",
@@ -431,6 +513,42 @@ def upload_to_s3(local_path: str, bucket: str, key: str, metadata: dict = None) 
             status_code=500,
             detail=f"Unexpected error during upload: {str(e)}"
         )
+
+
+def _get_wav_duration(wav_path: str) -> Optional[float]:
+    """
+    Return the actual duration of the extracted WAV in seconds using ffprobe.
+    This equals the original video duration because audio extraction preserves
+    the full timeline length.
+
+    Returns None if ffprobe is unavailable or the file cannot be probed.
+    The pipeline handles None gracefully — lip-sync falls back to last-segment-end.
+    """
+    if FFPROBE_PATH is None:
+        logger.debug("ffprobe not available — skipping audio duration measurement")
+        return None
+    try:
+        result = subprocess.run(
+            [
+                FFPROBE_PATH,
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                wav_path,
+            ],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+        val = result.stdout.strip()
+        return float(val) if val else None
+    except Exception as e:
+        logger.warning(f"ffprobe duration check failed ({e}); trying soundfile fallback")
+        try:
+            import soundfile as sf
+            with sf.SoundFile(wav_path) as f:
+                return round(len(f) / f.samplerate, 3)
+        except Exception as e2:
+            logger.warning(f"soundfile duration fallback also failed: {e2}")
+            return None
 
 
 # API Endpoint
@@ -515,6 +633,11 @@ async def video_to_audio(request: VideoToAudioRequest) -> VideoToAudioResponse:
             
             upload_to_s3(audio_path, request.audio_bucket, audio_key, upload_metadata)
             
+            # Measure actual audio/video duration for downstream lip-sync alignment
+            audio_duration = _get_wav_duration(audio_path)
+            if audio_duration:
+                logger.info(f"Audio/video duration: {audio_duration:.3f}s")
+
             # Step 5: Return success response
             logger.info(f"Job {job_id} completed successfully")
             
@@ -525,6 +648,7 @@ async def video_to_audio(request: VideoToAudioRequest) -> VideoToAudioResponse:
                 audio_key=audio_key,
                 file_size_bytes=conversion_metadata['output_size_bytes'],
                 duration_seconds=conversion_metadata['duration_seconds'],
+                audio_duration_seconds=audio_duration,
                 message="Video successfully converted to audio"
             )
     

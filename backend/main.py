@@ -1,5 +1,5 @@
 """
-main.py – Main FastAPI application v4.1
+main.py – Main FastAPI application v4.2
 """
 
 import os
@@ -17,15 +17,56 @@ load_dotenv()
 from config.db import connect_to_database
 from middleware.security import setup_middleware
 
-from python_controllers.auth_controller import router as auth_router
+from python_controllers.auth_controller   import router as auth_router
 from python_controllers.contact_controller import router as contact_router
-from python_controllers.forgot_password import router as password_router
-from python_controllers.upload_video import router as video_router
-from python_controllers.audio_controller import router as audio_router
-from python_controllers.text_controller import router as speech_router
-from python_controllers.target_language import router as translation_router
-from python_controllers.lip_sync import router as lipsync_router
-from python_controllers.video_rendering import router as video_merge_router
+from python_controllers.forgot_password   import router as password_router
+from python_controllers.upload_video      import router as video_router
+from python_controllers.audio_controller  import router as audio_router
+from python_controllers.text_controller   import router as speech_router
+from python_controllers.target_language   import router as translation_router
+from python_controllers.lip_sync          import router as lipsync_router
+from python_controllers.video_rendering   import router as video_merge_router
+# BUG FIX (missing module guard): audio_mastering.py may not be deployed yet.
+try:
+    from python_controllers.audio_mastering import router as mastering_router
+    _mastering_available = True
+except ImportError:
+    mastering_router = None
+    _mastering_available = False
+    import logging as _log
+    _log.getLogger(__name__).warning(
+        "python_controllers.audio_mastering not found – "
+        "audio mastering endpoint disabled."
+    )
+
+# New modules (Problems 3, 4, 7, 9, 10) — guarded so missing files don't break startup
+try:
+    from python_controllers.segment_validator import router as validator_router
+    _validator_available = True
+except ImportError:
+    validator_router = None
+    _validator_available = False
+    import logging as _log
+    _log.getLogger(__name__).warning("segment_validator not found – endpoint disabled")
+
+try:
+    from python_controllers.cultural_adapter import router as cultural_router
+    _cultural_available = True
+except ImportError:
+    cultural_router = None
+    _cultural_available = False
+    import logging as _log
+    _log.getLogger(__name__).warning("cultural_adapter not found – endpoint disabled")
+
+try:
+    from python_controllers.prosody_transfer import router as prosody_router
+    _prosody_available = True
+except ImportError:
+    prosody_router = None
+    _prosody_available = False
+    import logging as _log
+    _log.getLogger(__name__).warning("prosody_transfer not found – endpoint disabled")
+
 from dubbing_pipeline import router as pipeline_router
 
 
@@ -34,10 +75,9 @@ from dubbing_pipeline import router as pipeline_router
 async def lifespan(app: FastAPI):
     await connect_to_database()
     yield
-    # Optional: await close_database()
 
 
-# ── App (ONLY ONE INSTANCE) ─────────────────────────────────────────────────
+# ── App ─────────────────────────────────────────────────────────────────────
 app = FastAPI(
     lifespan=lifespan,
     title="Complete Media Processing API",
@@ -46,13 +86,14 @@ app = FastAPI(
         "**One-shot:** `POST /ai/dub-video`\n\n"
         "Voice cloning is handled by an internal sidecar service."
     ),
-    version="4.1.0",
+    version="4.2.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
 print("CORS_ORIGINS:", os.getenv("CORS_ORIGINS"))
 
-# ── Middleware ──────────────────────────────────────────────────────────────
+# ── Middleware ───────────────────────────────────────────────────────────────
 app.add_middleware(
     SessionMiddleware,
     secret_key=os.getenv("SESSION_SECRET", "SUPER_SECRET_KEY"),
@@ -62,51 +103,65 @@ app.add_middleware(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    # FIX B7: Read allowed origins from env so staging/prod frontends aren't blocked.
+    # Falls back to localhost:5173 for local dev if env var is unset.
+    allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:5173").split(","),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
 setup_middleware(app, {
     "rate_limit": {
-        "enabled": os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true",
-        "requests_per_minute": int(os.getenv("RATE_LIMIT_PER_MINUTE", "60")),
-        "requests_per_hour":   int(os.getenv("RATE_LIMIT_PER_HOUR", "1000")),
+        "enabled":              os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true",
+        "requests_per_minute":  int(os.getenv("RATE_LIMIT_PER_MINUTE", "60")),
+        "requests_per_hour":    int(os.getenv("RATE_LIMIT_PER_HOUR",   "1000")),
     },
     "api_key": {
         "enabled": os.getenv("API_KEY_ENABLED", "false").lower() == "true",
-        "keys": os.getenv("API_KEYS", "").split(",") if os.getenv("API_KEYS") else [],
+        "keys":    os.getenv("API_KEYS", "").split(",") if os.getenv("API_KEYS") else [],
     },
     "timeout": {
-        "enabled": True,
+        "enabled":         True,
         "timeout_seconds": int(os.getenv("REQUEST_TIMEOUT", "3600")),
     },
     "request_size_limit": {
-        "enabled": True,
+        "enabled":     True,
         "max_size_mb": int(os.getenv("MAX_REQUEST_SIZE_MB", "10")),
     },
 })
 
 
-# ── Routers ─────────────────────────────────────────────────────────────────
+# ── Routers ──────────────────────────────────────────────────────────────────
+# NOTE: pipeline_router is registered BEFORE the individual service routers so
+#       /ai/dub-video always wins over any conflicting /ai/* pattern.
+app.include_router(pipeline_router)      # /ai/dub-video   (orchestrator)
+
 app.include_router(auth_router)
 app.include_router(contact_router)
 app.include_router(password_router)
-app.include_router(pipeline_router)
 app.include_router(video_router)
-app.include_router(audio_router)
-app.include_router(speech_router)
-app.include_router(translation_router)
-app.include_router(lipsync_router)
-app.include_router(video_merge_router)
+app.include_router(audio_router)         # /ai/video-to-audio
+app.include_router(speech_router)        # /ai/speech-to-text
+app.include_router(translation_router)   # /ai/translate
+app.include_router(lipsync_router)       # /ai/lip-sync-align
+app.include_router(video_merge_router)   # /ai/video-merge
+if _mastering_available and mastering_router:
+    app.include_router(mastering_router)  # /ai/master-audio
+if _validator_available and validator_router:
+    app.include_router(validator_router)  # /ai/validate-segments   (Problem 7)
+if _cultural_available and cultural_router:
+    app.include_router(cultural_router)   # /ai/cultural-adapt      (Problems 3, 10)
+if _prosody_available and prosody_router:
+    app.include_router(prosody_router)    # /ai/prosody-transfer     (Problems 4, 9)
 
 
 # ── TTS sidecar proxy ────────────────────────────────────────────────────────
 TTS_SERVICE_URL = os.getenv("TTS_SERVICE_URL", "http://127.0.0.1:8002")
 
+
 async def call_tts_service(path: str, payload: dict) -> dict:
+    """Helper used by pipeline steps that need to call the TTS sidecar."""
     async with httpx.AsyncClient(timeout=3600) as client:
         try:
             resp = await client.post(f"{TTS_SERVICE_URL}{path}", json=payload)
@@ -124,18 +179,32 @@ async def call_tts_service(path: str, payload: dict) -> dict:
             )
 
 
-# ── Routes ──────────────────────────────────────────────────────────────────
+# ── Root & health routes ─────────────────────────────────────────────────────
 @app.get("/")
 async def root():
     return {
-        "service": "Complete Media Processing API",
-        "version": "4.1.0",
+        "service":      "Complete Media Processing API",
+        "version":      "4.2.0",
         "architecture": "main(:8001) + tts_sidecar(:8002) behind nginx(:8000)",
+        "endpoints": {
+            "dubbing":              "POST /ai/dub-video",
+            "video_to_audio":       "POST /ai/video-to-audio",
+            "speech_to_text":       "POST /ai/speech-to-text",
+            "translate":            "POST /ai/translate/timed",
+            "lip_sync":             "POST /ai/lip-sync-align",
+            "video_merge":          "POST /ai/video-merge",
+            "audio_mastering":      "POST /ai/master-audio",
+            "segment_validation":   "POST /ai/validate-segments",
+            "cultural_adaptation":  "POST /ai/cultural-adapt",
+            "prosody_transfer":     "POST /ai/prosody-transfer",
+            "docs":                 "GET  /docs",
+        },
     }
 
 
 @app.get("/health")
 async def global_health():
+    # Check TTS sidecar
     tts_status = "unknown"
     try:
         async with httpx.AsyncClient(timeout=5) as client:
@@ -147,17 +216,21 @@ async def global_health():
     return {
         "status": "healthy",
         "services": {
-            "video_to_audio": "available",
-            "speech_to_text": "available",
-            "translation":    "available",
-            "voice_cloning":  tts_status,
-            "lip_sync":       "available",
-            "video_merge":    "available",
+            "video_to_audio":       "available",
+            "speech_to_text":       "available",
+            "translation":          "available",
+            "voice_cloning":        tts_status,
+            "lip_sync":             "available",
+            "video_merge":          "available",
+            "audio_mastering":      "available" if _mastering_available else "disabled",
+            "segment_validation":   "available" if _validator_available else "disabled",
+            "cultural_adaptation":  "available" if _cultural_available  else "disabled",
+            "prosody_transfer":     "available" if _prosody_available   else "disabled",
         },
     }
 
 
-# ── Global exception handler ────────────────────────────────────────────────
+# ── Global exception handler ─────────────────────────────────────────────────
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     logging.error(f"Unhandled error: {exc}", exc_info=True)
@@ -167,7 +240,7 @@ async def global_exception_handler(request, exc):
     )
 
 
-# ── Run ─────────────────────────────────────────────────────────────────────
+# ── Dev entry point ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)
