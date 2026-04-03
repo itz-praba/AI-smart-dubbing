@@ -27,8 +27,6 @@ from python_controllers.target_language   import router as translation_router
 from python_controllers.lip_sync          import router as lipsync_router
 from python_controllers.video_rendering   import router as video_merge_router
 # BUG FIX (missing module guard): audio_mastering.py may not be deployed yet.
-# A bare import here would crash the entire FastAPI process at startup.
-# We guard it so the rest of the API stays healthy even without the module.
 try:
     from python_controllers.audio_mastering import router as mastering_router
     _mastering_available = True
@@ -38,10 +36,38 @@ except ImportError:
     import logging as _log
     _log.getLogger(__name__).warning(
         "python_controllers.audio_mastering not found – "
-        "audio mastering endpoint disabled. "
-        "Create the module to re-enable it."
+        "audio mastering endpoint disabled."
     )
-from dubbing_pipeline                     import router as pipeline_router
+
+# New modules (Problems 3, 4, 7, 9, 10) — guarded so missing files don't break startup
+try:
+    from python_controllers.segment_validator import router as validator_router
+    _validator_available = True
+except ImportError:
+    validator_router = None
+    _validator_available = False
+    import logging as _log
+    _log.getLogger(__name__).warning("segment_validator not found – endpoint disabled")
+
+try:
+    from python_controllers.cultural_adapter import router as cultural_router
+    _cultural_available = True
+except ImportError:
+    cultural_router = None
+    _cultural_available = False
+    import logging as _log
+    _log.getLogger(__name__).warning("cultural_adapter not found – endpoint disabled")
+
+try:
+    from python_controllers.prosody_transfer import router as prosody_router
+    _prosody_available = True
+except ImportError:
+    prosody_router = None
+    _prosody_available = False
+    import logging as _log
+    _log.getLogger(__name__).warning("prosody_transfer not found – endpoint disabled")
+
+from dubbing_pipeline import router as pipeline_router
 
 
 # ── Lifespan (startup / shutdown) ───────────────────────────────────────────
@@ -121,7 +147,13 @@ app.include_router(translation_router)   # /ai/translate
 app.include_router(lipsync_router)       # /ai/lip-sync-align
 app.include_router(video_merge_router)   # /ai/video-merge
 if _mastering_available and mastering_router:
-    app.include_router(mastering_router)  # /ai/master-audio (only if module present)
+    app.include_router(mastering_router)  # /ai/master-audio
+if _validator_available and validator_router:
+    app.include_router(validator_router)  # /ai/validate-segments   (Problem 7)
+if _cultural_available and cultural_router:
+    app.include_router(cultural_router)   # /ai/cultural-adapt      (Problems 3, 10)
+if _prosody_available and prosody_router:
+    app.include_router(prosody_router)    # /ai/prosody-transfer     (Problems 4, 9)
 
 
 # ── TTS sidecar proxy ────────────────────────────────────────────────────────
@@ -155,14 +187,17 @@ async def root():
         "version":      "4.2.0",
         "architecture": "main(:8001) + tts_sidecar(:8002) behind nginx(:8000)",
         "endpoints": {
-            "dubbing":           "POST /ai/dub-video",
-            "audio_mastering":   "POST /ai/master-audio",   # ← NEW
-            "video_to_audio":    "POST /ai/video-to-audio",
-            "speech_to_text":    "POST /ai/speech-to-text",
-            "translate":         "POST /ai/translate/timed",
-            "lip_sync":          "POST /ai/lip-sync-align",
-            "video_merge":       "POST /ai/video-merge",
-            "docs":              "GET  /docs",
+            "dubbing":              "POST /ai/dub-video",
+            "video_to_audio":       "POST /ai/video-to-audio",
+            "speech_to_text":       "POST /ai/speech-to-text",
+            "translate":            "POST /ai/translate/timed",
+            "lip_sync":             "POST /ai/lip-sync-align",
+            "video_merge":          "POST /ai/video-merge",
+            "audio_mastering":      "POST /ai/master-audio",
+            "segment_validation":   "POST /ai/validate-segments",
+            "cultural_adaptation":  "POST /ai/cultural-adapt",
+            "prosody_transfer":     "POST /ai/prosody-transfer",
+            "docs":                 "GET  /docs",
         },
     }
 
@@ -181,13 +216,16 @@ async def global_health():
     return {
         "status": "healthy",
         "services": {
-            "video_to_audio":  "available",
-            "speech_to_text":  "available",
-            "translation":     "available",
-            "voice_cloning":   tts_status,       # runs on sidecar :8002
-            "lip_sync":        "available",
-            "video_merge":     "available",
-            "audio_mastering": "available",       # ← NEW
+            "video_to_audio":       "available",
+            "speech_to_text":       "available",
+            "translation":          "available",
+            "voice_cloning":        tts_status,
+            "lip_sync":             "available",
+            "video_merge":          "available",
+            "audio_mastering":      "available" if _mastering_available else "disabled",
+            "segment_validation":   "available" if _validator_available else "disabled",
+            "cultural_adaptation":  "available" if _cultural_available  else "disabled",
+            "prosody_transfer":     "available" if _prosody_available   else "disabled",
         },
     }
 

@@ -308,12 +308,31 @@ def master_dubbed_audio(
             elif len(orig) < len(audio):
                 orig = np.pad(orig, (0, len(audio) - len(orig)))
 
+            # ROOT CAUSE 3 FIX — original audio bleed:
+            # The previous implementation added `ducked_orig` (the attenuated
+            # original audio signal) directly into the dubbed output:
+            #
+            #   audio = np.clip(audio + ducked_orig, -1.0, 1.0)
+            #
+            # This is WRONG for dubbing. The original audio contains the source
+            # language voice. Adding it back — even at -12 dB — causes it to
+            # bleed audibly through the dubbed track, especially in quiet gaps
+            # between dubbed lines where the dubbed RMS is near zero.
+            #
+            # The CORRECT use of the original audio in BGM ducking is as a
+            # SIDECHAIN ONLY: use it to DETECT where background music exists
+            # (frames where dubbed voice is absent), then ATTENUATE the dubbed
+            # track in those regions to prevent TTS silence from sounding too
+            # dead compared to the source video's ambient sound.
+            #
+            # We do NOT add any of the original signal to the output.
+            # The dubbed track IS the output — we only shape its gain envelope.
             mask = _build_bgm_duck_mask(audio, orig, sr, cfg.bgm_duck_db)
-            # Apply ducking to original background, then mix with dubbed voice
-            ducked_orig = orig * (1.0 - mask) * 10.0 ** (cfg.bgm_duck_db / 20.0)
-            audio = np.clip(audio + ducked_orig, -1.0, 1.0).astype(np.float32)
+
+            # Apply gain mask to the DUBBED audio only — do not add original
+            audio = np.clip(audio * mask, -1.0, 1.0).astype(np.float32)
             bgm_ducking_applied = True
-            logger.info(f"BGM ducking applied (duck={cfg.bgm_duck_db} dB)")
+            logger.info(f"BGM ducking applied to dubbed track (duck={cfg.bgm_duck_db} dB)")
         except Exception as e:
             logger.warning(f"BGM ducking skipped: {e}")
 

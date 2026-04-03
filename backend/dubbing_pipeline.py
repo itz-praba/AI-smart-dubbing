@@ -1,17 +1,21 @@
 """
-dubbing_pipeline.py – Complete Video Dubbing Pipeline  v4.2
+dubbing_pipeline.py – Complete Video Dubbing Pipeline  v5.0
 ============================================================
-Orchestrates all 7 services to produce a fully dubbed, professionally
+Orchestrates all 10 steps to produce a fully dubbed, professionally
 mastered video from a single video S3 key.
 
-Pipeline:
-  1. video-to-audio     → Extract audio from video
-  2. speech-to-text     → Transcribe + diarize audio
-  3. translate/timed    → Translate segments
-  4. voice-clone-tts    → Clone each speaker's voice  (TTS sidecar :8002)
-  5. lip-sync-align     → Align dubbed audio to original timing
-  5b. audio-mastering   → EQ + compress + loudness normalise + BGM duck  ← NEW
-  6. video-merge        → Merge mastered audio back into video
+Solves all 10 common dubbing problems:
+
+  1. video-to-audio       → Extract audio from video
+  2. speech-to-text       → Transcribe + diarize audio
+  3. translate/timed      → Translate segments  [Problem 3 partial]
+  3a. segment-validation  → Diff source vs translated; catch missing/empty  [Problem 7]
+  3b. cultural-adapt      → LLM idiom/register/cultural rewrite  [Problems 3, 10]
+  4. voice-clone-tts      → Clone each speaker's voice  (TTS sidecar :8002)  [Problem 4 partial]
+  4b. prosody-transfer    → Match pitch, energy, emotion from source  [Problems 4, 9]
+  5. lip-sync-align       → Align timing + natural pause normalisation  [Problems 1, 2, 8]
+  5b. audio-mastering     → EQ + compress + loudness normalise + BGM duck  [Problems 5, 6]
+  6. video-merge          → Merge mastered audio back into video
 """
 
 import os
@@ -35,6 +39,9 @@ from python_controllers.text_controller  import router as speech_router
 from python_controllers.target_language  import router as translation_router
 from python_controllers.lip_sync         import router as lipsync_router
 from python_controllers.video_rendering  import router as rendering_router
+from python_controllers.segment_validator import router as validator_router    # NEW — Problem 7
+from python_controllers.cultural_adapter  import router as cultural_router     # NEW — Problems 3, 10
+from python_controllers.prosody_transfer  import router as prosody_router      # NEW — Problems 4, 9
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,6 +66,8 @@ LANG_2_TO_3 = {
     "cs": "ces", "da": "dan", "fi": "fin", "no": "nor",
     "sv": "swe", "el": "ell", "he": "heb", "th": "tha",
     "vi": "vie", "ta": "tam",
+    "te": "tel",   # Telugu
+    "ur": "urd",   # Urdu
     "tgl": "tgl",  # Tanglish — no ISO 639-2 code; use "tgl" as custom tag
 }
 
@@ -101,7 +110,7 @@ class DubbingRequest(BaseModel):
     output_key_prefix:  Optional[str] = Field(None, max_length=512,
                                                description="S3 prefix for outputs. Default: dubbed/<id>/")
 
-    # ── Optional – audio mastering control  ← NEW ─────────────
+    # ── Optional – audio mastering control  ← existing ───────────
     enable_audio_mastering: bool  = Field(
         True,
         description=(
@@ -128,6 +137,69 @@ class DubbingRequest(BaseModel):
                                      description="Compression ratio (e.g. 4.0 = 4:1)")
     comp_makeup_db:    float = Field(6.0,   ge=0.0,   le=24.0,
                                      description="Make-up gain after compression (dB)")
+
+    # ── Optional – segment validation (Problem 7) ─────────────────
+    enable_segment_validation: bool = Field(
+        True,
+        description=(
+            "After translation, validate segment completeness: detect missing, "
+            "empty, extra, or truncated translations. Auto-repairs empty segments "
+            "with source text fallback. Fixes Problem 7: missing / extra dialogue."
+        )
+    )
+    block_on_segment_errors: bool = Field(
+        True,
+        description="Halt pipeline if critical segment errors are found (missing/empty segments)."
+    )
+
+    # ── Optional – cultural adaptation (Problems 3, 10) ───────────
+    enable_cultural_adaptation: bool = Field(
+        True,
+        description=(
+            "Run LLM-powered post-translation rewrite to adapt idioms, honorifics, "
+            "and cultural references for the target language. "
+            "Fixes Problems 3 (translation accuracy) and 10 (cultural adaptation). "
+            "Requires ANTHROPIC_API_KEY env var."
+        )
+    )
+    content_type: str = Field(
+        "drama",
+        description="Content type hint for cultural adaptation: drama|documentary|comedy|children|news"
+    )
+    character_profile: Optional[str] = Field(
+        None,
+        description="Optional speaker description for the cultural adapter (e.g. 'elderly formal elder')."
+    )
+
+    # ── Optional – prosody / emotion transfer (Problems 4, 9) ─────
+    enable_prosody_transfer: bool = Field(
+        True,
+        description=(
+            "Transfer pitch, energy, and emotional tone from the original audio "
+            "segment to the flat TTS output. "
+            "Fixes Problems 4 (voice acting mismatch) and 9 (emotional tone differences)."
+        )
+    )
+
+    # ── Optional – VAD / transcription controls ────────────────────
+    vad_filter: bool = Field(
+        False,
+        description=(
+            "Enable Silero VAD during speech-to-text. "
+            "DEFAULT IS NOW FALSE — VAD was silently dropping the last 2–3s of "
+            "speech in short dubbing clips (energy drops at sentence end). "
+            "Set to True only for long recordings with significant silence sections."
+        )
+    )
+    vad_threshold: float = Field(
+        0.15,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Silero VAD speech probability threshold (only used when vad_filter=True). "
+            "0.15 = maximum recall. Raise toward 0.5 for very noisy recordings."
+        )
+    )
 
     @validator("video_key")
     def validate_video_key(cls, v):
@@ -189,8 +261,15 @@ class DubbingResponse(BaseModel):
     total_duration_seconds: float
     segments_count:       int
     speakers_detected:    int
-    mastering_applied:    bool          # ← NEW
-    mastered_audio_key:   Optional[str] = None   # ← NEW
+    mastering_applied:    bool
+    mastered_audio_key:   Optional[str] = None
+    # New result fields for Problems 3, 7, 9, 10
+    validation_issues:    int = 0
+    segments_repaired:    int = 0
+    cultural_changes:     int = 0
+    segments_flagged:     int = 0
+    prosody_applied:      bool = False
+    translation_key:      Optional[str] = None   # S3 key of the saved translation JSON
     message:              str
 
 
@@ -222,12 +301,20 @@ async def _step1_video_to_audio(pipeline_id, video_bucket, video_key, output_buc
     resp = await video_to_audio(req)
     if not resp.success:
         raise HTTPException(500, f"Step 1 failed: {resp.message}")
-    logger.info(f"[{pipeline_id}] Step 1 ✓ → {resp.audio_key}")
-    return resp.audio_bucket, resp.audio_key
+    # PROBLEM 1 FIX: capture actual video/audio duration so lip-sync can
+    # extend the output WAV to cover the full video length.
+    video_duration = resp.audio_duration_seconds
+    logger.info(
+        f"[{pipeline_id}] Step 1 ✓ → {resp.audio_key} "
+        f"| video_duration={video_duration:.2f}s" if video_duration else f"[{pipeline_id}] Step 1 ✓ → {resp.audio_key}"
+    )
+    return resp.audio_bucket, resp.audio_key, video_duration
 
 
 async def _step2_speech_to_text(pipeline_id, audio_bucket, audio_key, output_bucket,
-                                 source_language, model_size, diarize):
+                                 source_language, model_size, diarize,
+                                 vad_filter: bool = True,
+                                 vad_threshold: float = 0.20):
     from python_controllers.text_controller import SpeechToTextRequest, speech_to_text
     req  = SpeechToTextRequest(
         audio_bucket=audio_bucket, audio_key=audio_key,
@@ -236,6 +323,11 @@ async def _step2_speech_to_text(pipeline_id, audio_bucket, audio_key, output_buc
         diarize=diarize,
         model_size=model_size,
         word_timestamps=True,
+        # Pass through VAD settings — the dubbing pipeline default is
+        # vad_filter=True with threshold=0.20 (maximum recall).
+        # Set vad_filter=False in DubbingRequest if truncation persists.
+        vad_filter=vad_filter,
+        vad_threshold=vad_threshold,
     )
     resp = await speech_to_text(req)
     if not resp.success:
@@ -248,7 +340,7 @@ async def _step2_speech_to_text(pipeline_id, audio_bucket, audio_key, output_buc
 
 
 async def _step3_translate(pipeline_id, transcript_bucket, transcript_key,
-                            source_lang, target_lang):
+                            source_lang, target_lang, output_bucket: str, prefix: str):
     from python_controllers.target_language import (
         TimedTranslationRequest, TimedSegment, translate_timed
     )
@@ -262,9 +354,13 @@ async def _step3_translate(pipeline_id, transcript_bucket, transcript_key,
         for i, s in enumerate(raw_segments)
     ]
     req  = TimedTranslationRequest(
-        segments=timed_segments,
-        source_lang=source_lang,
-        target_lang=target_lang,
+        segments           = timed_segments,
+        source_lang        = source_lang,
+        target_lang        = target_lang,
+        # Save the raw translation JSON to S3 so it can be inspected,
+        # re-processed, or used for debugging without re-running translation.
+        output_bucket      = output_bucket,
+        output_key_prefix  = f"{prefix}translations/",
     )
     resp = await translate_timed(req)
     if not resp.success:
@@ -282,8 +378,12 @@ async def _step3_translate(pipeline_id, transcript_bucket, transcript_key,
         }
         for seg in resp.segments
     ]
-    logger.info(f"[{pipeline_id}] Step 3 ✓ → {len(translated)} segments translated")
-    return translated
+    logger.info(
+        f"[{pipeline_id}] Step 3 ✓ → {len(translated)} segments translated"
+        + (f" | saved to s3://{resp.output_bucket}/{resp.output_key}"
+           if resp.output_key else "")
+    )
+    return translated, resp.output_key   # return translation_key for pipeline response
 
 
 async def _step4_voice_clone(
@@ -459,16 +559,252 @@ async def _concat_tts_segments(
         import shutil as _shutil
         _shutil.rmtree(work_dir, ignore_errors=True)
 
+async def _step3b_validate_segments(
+    pipeline_id: str,
+    source_segments: list,
+    translated_segments: list,
+    source_lang: str,
+    target_lang: str,
+    block_on_errors: bool,
+) -> tuple:
+    """
+    Step 3b — Segment validation (Problem 7: missing / extra / empty dialogue).
+
+    Diffs translated segments against the source transcript.
+    Auto-repairs empty/missing segments with source-text fallback.
+    Returns (validated_segments, issue_count, repaired_count).
+    """
+    from python_controllers.segment_validator import (
+        ValidationRequest, SourceSegment, TranslatedSegment as VS,
+        validate_segments,
+    )
+
+    src_segs = [
+        SourceSegment(index=s["index"], start=s["start"], end=s["end"], text=s["text"])
+        for s in source_segments
+    ]
+    tgt_segs = [
+        VS(
+            index           = s["index"],
+            start           = s["start"],
+            end             = s["end"],
+            source_text     = s.get("source_text", s.get("text", "")),
+            translated_text = s["translated_text"],
+        )
+        for s in translated_segments
+    ]
+
+    req  = ValidationRequest(
+        source_segments      = src_segs,
+        translated_segments  = tgt_segs,
+        source_lang          = source_lang,
+        target_lang          = target_lang,
+        block_on_missing     = block_on_errors,
+        block_on_empty       = block_on_errors,
+        block_on_count_mismatch = False,   # non-fatal: log and continue
+        auto_repair_empty    = True,
+        truncation_check     = True,
+        timing_check         = True,
+    )
+    resp = validate_segments(req)
+
+    # Rebuild translated_segments list from validated (may contain repaired segments)
+    validated = [
+        {
+            "index":           s.index,
+            "start":           s.start,
+            "end":             s.end,
+            "source_text":     s.source_text,
+            "translated_text": s.translated_text,
+            # preserve speaker tag from original if present
+            "speaker":         next(
+                (t.get("speaker", "SPEAKER_00") for t in translated_segments if t["index"] == s.index),
+                "SPEAKER_00",
+            ),
+        }
+        for s in resp.validated_segments
+    ]
+
+    logger.info(
+        f"[{pipeline_id}] Step 3b ✓ → valid={resp.is_valid} "
+        f"issues={resp.issue_count} repaired={resp.repaired_segments}"
+    )
+    return validated, resp.issue_count, resp.repaired_segments
+
+
+async def _step3c_cultural_adapt(
+    pipeline_id: str,
+    translated_segments: list,
+    source_lang: str,
+    target_lang: str,
+    content_type: str,
+    character_profile: Optional[str],
+) -> tuple:
+    """
+    Step 3c — Cultural & idiomatic adaptation (Problems 3, 10).
+
+    Sends translated segments to the LLM-powered cultural adapter.
+    Returns (adapted_segments, changed_count, flagged_count).
+    Gracefully falls back to original translations if the LLM is unavailable.
+    """
+    from python_controllers.cultural_adapter import (
+        CulturalAdaptationRequest, SegmentForAdaptation, cultural_adapt,
+    )
+
+    segs = [
+        SegmentForAdaptation(
+            index           = s["index"],
+            start           = s["start"],
+            end             = s["end"],
+            source_text     = s.get("source_text", ""),
+            translated_text = s["translated_text"],
+            speaker         = s.get("speaker"),
+        )
+        for s in translated_segments
+    ]
+
+    req  = CulturalAdaptationRequest(
+        segments           = segs,
+        source_lang        = source_lang,
+        target_lang        = target_lang,
+        content_type       = content_type,
+        character_profile  = character_profile,
+        preserve_length    = True,
+        flag_for_review    = True,
+        fallback_on_error  = True,   # never break the pipeline
+    )
+    resp = await cultural_adapt(req)
+
+    # Merge adapted text back into segment dicts
+    adapted_map = {s.index: s.adapted_text for s in resp.adapted_segments}
+    for seg in translated_segments:
+        seg["translated_text"] = adapted_map.get(seg["index"], seg["translated_text"])
+
+    logger.info(
+        f"[{pipeline_id}] Step 3c ✓ → changed={resp.segments_changed} "
+        f"flagged={resp.segments_flagged} llm_calls={resp.llm_calls_made}"
+    )
+    return translated_segments, resp.segments_changed, resp.segments_flagged
+
+
+async def _step4b_prosody_transfer(
+    pipeline_id: str,
+    voiced_segments: list,
+    audio_bucket: str,
+    original_audio_key: str,
+    output_bucket: str,
+    prefix: str,
+) -> tuple:
+    """
+    Step 4b — Prosody / emotion transfer (Problems 4, 9).
+
+    For each segment, extracts pitch/energy/emotion from the corresponding
+    slice of the original audio and applies it to the flat TTS WAV.
+    Returns (updated_voiced_segments, prosody_applied_bool).
+
+    NOTE: This step requires per-segment source audio slices.  We use the
+    full original audio + segment timestamps to slice on-the-fly.
+    Falls back gracefully if the original audio or classifier is unavailable.
+    """
+    import tempfile
+    import soundfile as sf
+    import numpy as np
+
+    from python_controllers.prosody_transfer import (
+        BatchProsodyRequest, prosody_transfer_batch,
+    )
+
+    work_dir = TEMP_DIR / f"prosody_{pipeline_id[:8]}"
+    work_dir.mkdir(exist_ok=True)
+
+    try:
+        # Download the original full audio once
+        orig_local = str(work_dir / "original_full.wav")
+        try:
+            s3_client.download_file(audio_bucket, original_audio_key, orig_local)
+        except Exception as e:
+            logger.warning(f"[{pipeline_id}] Prosody: could not download original audio ({e}); skipping")
+            return voiced_segments, False
+
+        orig_audio, orig_sr = sf.read(orig_local, dtype="float32")
+        if orig_audio.ndim > 1:
+            orig_audio = orig_audio.mean(axis=1)
+
+        # Build per-segment source slices and upload to S3 for the batch endpoint
+        batch_segs = []
+        for seg in voiced_segments:
+            start_frame = int(seg["start"] * orig_sr)
+            end_frame   = int(seg["end"]   * orig_sr)
+            slice_audio = orig_audio[start_frame:end_frame]
+            if len(slice_audio) < orig_sr * 0.1:
+                continue   # skip < 100ms slices — too short for analysis
+
+            slice_key  = f"{prefix}prosody_src/seg_{seg['index']:04d}.wav"
+            slice_path = str(work_dir / f"src_{seg['index']:04d}.wav")
+            sf.write(slice_path, slice_audio, orig_sr)
+            s3_client.upload_file(slice_path, output_bucket, slice_key)
+
+            batch_segs.append({
+                "index":            seg["index"],
+                "source_audio_key": slice_key,
+                "dubbed_audio_key": seg["tts_audio_key"],
+            })
+
+        if not batch_segs:
+            logger.warning(f"[{pipeline_id}] Prosody: no valid segments for batch; skipping")
+            return voiced_segments, False
+
+        req  = BatchProsodyRequest(
+            bucket             = output_bucket,
+            output_bucket      = output_bucket,
+            output_key_prefix  = f"{prefix}prosody_out/",
+            segments           = batch_segs,
+            enable_pitch_transfer  = True,
+            enable_energy_transfer = True,
+            enable_emotion_eq      = True,
+            enable_speed_nudge     = True,
+            pitch_strength         = 0.6,
+            energy_strength        = 0.8,
+        )
+        resp = await prosody_transfer_batch(req)
+
+        # Remap tts_audio_key to the prosody-shaped output
+        prosody_map = {
+            r["index"]: r["output_key"]
+            for r in resp.results
+            if r.get("success") and r.get("output_key")
+        }
+        for seg in voiced_segments:
+            if seg["index"] in prosody_map:
+                seg["tts_audio_key"] = prosody_map[seg["index"]]
+
+        applied = resp.segments_processed > 0
+        logger.info(
+            f"[{pipeline_id}] Step 4b ✓ → prosody applied to "
+            f"{resp.segments_processed}/{len(voiced_segments)} segments"
+        )
+        return voiced_segments, applied
+
+    except Exception as e:
+        logger.warning(f"[{pipeline_id}] Step 4b (prosody) failed ({e}); continuing without prosody")
+        return voiced_segments, False
+    finally:
+        import shutil
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 async def _step5_lip_sync(
     pipeline_id: str,
     voiced_segments: list,
     output_bucket: str,
     prefix: str,
     target_lang: str,
+    video_duration: Optional[float] = None,
 ) -> str:
     try:
         logger.info(
             f"[{pipeline_id}] Starting lip-sync with {len(voiced_segments)} segments"
+            + (f" | video_duration={video_duration:.2f}s" if video_duration else "")
         )
 
         from python_controllers.lip_sync import (
@@ -497,6 +833,7 @@ async def _step5_lip_sync(
             output_key_prefix=f"{prefix}lipsync/",
             enable_time_stretch=True,
             target_language=target_lang,
+            video_duration=video_duration,   # Problem 1 fix: extend WAV to full video length
         )
 
         resp = await lip_sync_align(req)
@@ -670,11 +1007,14 @@ async def dub_video(request: DubbingRequest) -> DubbingResponse:
     # ── Step 1 – video → audio ───────────────────────────────────────────────
     t = _step_timer()
     try:
-        audio_bucket, audio_key = await _step1_video_to_audio(
+        # _step1_video_to_audio returns (audio_bucket, audio_key, video_duration)
+        # Bug 1 fix: was only unpacking 2 values — caused "too many values to unpack"
+        audio_bucket, audio_key, video_duration = await _step1_video_to_audio(
             pipeline_id, request.video_bucket, request.video_key,
             output_bucket, prefix)
         record("1-video-to-audio", "done", t(), out_key=audio_key)
     except Exception as e:
+        logger.exception(f"[{pipeline_id}] Step 1 crashed")
         record("1-video-to-audio", "failed", t(), error=str(e))
         raise HTTPException(500, f"Pipeline failed at Step 1: {e}")
 
@@ -685,23 +1025,84 @@ async def dub_video(request: DubbingRequest) -> DubbingResponse:
         transcript_bucket, transcript_key, detected_lang, speakers, segments_count = \
             await _step2_speech_to_text(
                 pipeline_id, audio_bucket, audio_key, output_bucket,
-                request.source_language, request.whisper_model_size, request.diarize)
+                request.source_language, request.whisper_model_size, request.diarize,
+                vad_filter=request.vad_filter,
+                vad_threshold=request.vad_threshold,
+            )
         source_lang = request.source_language or detected_lang
         record("2-speech-to-text", "done", t(), out_key=transcript_key)
     except Exception as e:
+        logger.exception(f"[{pipeline_id}] Step 2 crashed")
         record("2-speech-to-text", "failed", t(), error=str(e))
         raise HTTPException(500, f"Pipeline failed at Step 2: {e}")
 
     # ── Step 3 – translate ───────────────────────────────────────────────────
+    translation_key = None
     t = _step_timer()
     try:
-        translated_segments = await _step3_translate(
+        translated_segments, translation_key = await _step3_translate(
             pipeline_id, transcript_bucket, transcript_key,
-            source_lang, request.target_language)
-        record("3-translation", "done", t())
+            source_lang, request.target_language,
+            output_bucket=output_bucket,
+            prefix=prefix,
+        )
+        record("3-translation", "done", t(), out_key=translation_key)
     except Exception as e:
+        logger.exception(f"[{pipeline_id}] Step 3 crashed")
         record("3-translation", "failed", t(), error=str(e))
         raise HTTPException(500, f"Pipeline failed at Step 3: {e}")
+
+    # ── Step 3b – segment validation (Problem 7) ─────────────────────────────
+    validation_issues  = 0
+    segments_repaired  = 0
+    # Build source segment list from original transcript for diffing
+    try:
+        raw_transcript = _s3_read_json(transcript_bucket, transcript_key)
+        raw_source_segs = [
+            {"index": i, "start": s["start"], "end": s["end"], "text": s["text"]}
+            for i, s in enumerate(raw_transcript.get("segments", []))
+        ]
+    except Exception:
+        raw_source_segs = []   # non-fatal: skip diff if transcript unreadable
+
+    t = _step_timer()
+    if request.enable_segment_validation and raw_source_segs:
+        try:
+            translated_segments, validation_issues, segments_repaired = \
+                await _step3b_validate_segments(
+                    pipeline_id, raw_source_segs, translated_segments,
+                    source_lang, request.target_language,
+                    request.block_on_segment_errors,
+                )
+            record("3b-segment-validation", "done", t())
+        except HTTPException:
+            record("3b-segment-validation", "failed", t(), error="Blocking validation errors")
+            raise
+        except Exception as e:
+            record("3b-segment-validation", "failed", t(), error=str(e))
+            logger.warning(f"[{pipeline_id}] Step 3b failed non-fatally: {e}")
+    else:
+        record("3b-segment-validation", "skipped", 0.0)
+
+    # ── Step 3c – cultural adaptation (Problems 3, 10) ───────────────────────
+    cultural_changes = 0
+    segments_flagged = 0
+    t = _step_timer()
+    if request.enable_cultural_adaptation:
+        try:
+            translated_segments, cultural_changes, segments_flagged = \
+                await _step3c_cultural_adapt(
+                    pipeline_id, translated_segments,
+                    source_lang, request.target_language,
+                    request.content_type,
+                    request.character_profile,
+                )
+            record("3c-cultural-adaptation", "done", t())
+        except Exception as e:
+            record("3c-cultural-adaptation", "failed", t(), error=str(e))
+            logger.warning(f"[{pipeline_id}] Step 3c failed non-fatally: {e}")
+    else:
+        record("3c-cultural-adaptation", "skipped", 0.0)
 
     # ── Step 4 – voice clone (TTS sidecar) ───────────────────────────────────
     t = _step_timer()
@@ -712,17 +1113,39 @@ async def dub_video(request: DubbingRequest) -> DubbingResponse:
             output_bucket, request.target_language, prefix)
         record("4-voice-cloning", "done", t())
     except Exception as e:
+        logger.exception(f"[{pipeline_id}] Step 4 crashed")
         record("4-voice-cloning", "failed", t(), error=str(e))
         raise HTTPException(500, f"Pipeline failed at Step 4: {e}")
+
+    # ── Step 4b – prosody / emotion transfer (Problems 4, 9) ─────────────────
+    prosody_applied = False
+    t = _step_timer()
+    if request.enable_prosody_transfer:
+        try:
+            voiced_segments, prosody_applied = await _step4b_prosody_transfer(
+                pipeline_id, voiced_segments,
+                audio_bucket, audio_key,
+                output_bucket, prefix,
+            )
+            record("4b-prosody-transfer", "done" if prosody_applied else "skipped", t())
+        except Exception as e:
+            record("4b-prosody-transfer", "failed", t(), error=str(e))
+            logger.warning(f"[{pipeline_id}] Step 4b failed non-fatally: {e}")
+    else:
+        record("4b-prosody-transfer", "skipped", 0.0)
 
     # ── Step 5 – lip-sync align ───────────────────────────────────────────────
     t = _step_timer()
     if request.enable_lip_sync:
         try:
             dubbed_audio_key = await _step5_lip_sync(
-                pipeline_id, voiced_segments, output_bucket, prefix, request.target_language)
+                pipeline_id, voiced_segments, output_bucket, prefix,
+                request.target_language,
+                video_duration=video_duration,   # Problem 1 fix: full video coverage
+            )
             record("5-lip-sync", "done", t(), out_key=dubbed_audio_key)
         except Exception as e:
+            logger.exception(f"[{pipeline_id}] Step 5 crashed")
             record("5-lip-sync", "failed", t(), error=str(e))
             raise HTTPException(500, f"Pipeline failed at Step 5: {e}")
     else:
@@ -783,6 +1206,7 @@ async def dub_video(request: DubbingRequest) -> DubbingResponse:
         )
         record("6-video-merge", "done", t(), out_key=final_video_key)
     except Exception as e:
+        logger.exception(f"[{pipeline_id}] Step 6 crashed")
         record("6-video-merge", "failed", t(), error=str(e))
         raise HTTPException(500, f"Pipeline failed at Step 6: {e}")
 
@@ -809,11 +1233,21 @@ async def dub_video(request: DubbingRequest) -> DubbingResponse:
         speakers_detected    = speakers,
         mastering_applied    = mastering_applied,
         mastered_audio_key   = mastered_audio_key,
+        validation_issues    = validation_issues,
+        segments_repaired    = segments_repaired,
+        cultural_changes     = cultural_changes,
+        segments_flagged     = segments_flagged,
+        prosody_applied      = prosody_applied,
+        translation_key      = translation_key,
         message=(
             f"✓ Video dubbed '{source_lang}' → '{request.target_language}' "
             f"in {total:.1f}s | {segments_count} segments | "
             f"{speakers} speaker(s) | "
-            f"mastering: {'✓' if mastering_applied else '✗'}"
+            f"mastering: {'✓' if mastering_applied else '✗'} | "
+            f"cultural: {cultural_changes} rewrites | "
+            f"prosody: {'✓' if prosody_applied else '✗'} | "
+            f"validation: {validation_issues} issue(s) | "
+            f"translation: {'saved' if translation_key else 'not saved'}"
         ),
     )
 
@@ -828,12 +1262,15 @@ async def pipeline_health():
 
     # Individual service modules
     for name, mod in {
-        "audio_controller":  "python_controllers.audio_controller",
-        "text_controller":   "python_controllers.text_controller",
-        "target_language":   "python_controllers.target_language",
-        "lip_sync":          "python_controllers.lip_sync",
-        "video_rendering":   "python_controllers.video_rendering",
-        "audio_mastering":   "python_controllers.audio_mastering",   # ← NEW
+        "audio_controller":   "python_controllers.audio_controller",
+        "text_controller":    "python_controllers.text_controller",
+        "target_language":    "python_controllers.target_language",
+        "lip_sync":           "python_controllers.lip_sync",
+        "video_rendering":    "python_controllers.video_rendering",
+        "audio_mastering":    "python_controllers.audio_mastering",
+        "segment_validator":  "python_controllers.segment_validator",   # Problem 7
+        "cultural_adapter":   "python_controllers.cultural_adapter",    # Problems 3, 10
+        "prosody_transfer":   "python_controllers.prosody_transfer",    # Problems 4, 9
     }.items():
         try:
             __import__(mod)
@@ -870,9 +1307,12 @@ async def pipeline_health():
             "1-video-to-audio",
             "2-speech-to-text",
             "3-translation",
+            "3b-segment-validation",    # Problem 7
+            "3c-cultural-adaptation",   # Problems 3, 10
             "4-voice-cloning",
-            "5-lip-sync",
-            "5b-audio-mastering",   # ← NEW
+            "4b-prosody-transfer",      # Problems 4, 9
+            "5-lip-sync",               # Problem 1, 2, 8 (gap normalisation)
+            "5b-audio-mastering",       # Problems 5, 6
             "6-video-merge",
         ],
         "timestamp": datetime.utcnow().isoformat(),

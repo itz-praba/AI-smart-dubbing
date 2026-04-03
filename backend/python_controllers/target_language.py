@@ -1,13 +1,18 @@
 import os
+import json
 import uuid
 import time
 import asyncio
 import logging
+from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 from contextlib import asynccontextmanager
 
 import torch
+import boto3
+from botocore.config import Config as BotoCoreConfig
+from botocore.exceptions import ClientError
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field, validator
 from transformers import (
@@ -30,6 +35,37 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ai", tags=["Translation"])
 
 # =====================================================
+# S3 CLIENT (graceful — disabled if creds absent)
+# =====================================================
+TEMP_DIR = Path("temp")
+TEMP_DIR.mkdir(exist_ok=True)
+
+_S3_REQUIRED = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"]
+S3_ENABLED   = all(os.getenv(v) for v in _S3_REQUIRED)
+s3_client    = None
+
+if S3_ENABLED:
+    try:
+        s3_client = boto3.client(
+            "s3",
+            aws_access_key_id     = os.getenv("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY"),
+            region_name           = os.getenv("AWS_REGION"),
+            config=BotoCoreConfig(
+                retries={"max_attempts": 3, "mode": "standard"},
+                connect_timeout=10,
+                read_timeout=60,
+            ),
+        )
+        s3_client.list_buckets()
+        logger.info("translation: S3 client initialised")
+    except Exception as e:
+        logger.warning(f"translation: S3 init failed ({e}) – S3 upload disabled")
+        S3_ENABLED = False
+else:
+    logger.warning("translation: AWS env vars missing – S3 upload disabled")
+
+# =====================================================
 # CONSTANTS AND CONFIGURATION
 # =====================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -41,6 +77,9 @@ SUPPORTED_LANGS = {
     "zh", "ja", "ko", "ar", "tr", "pl", "vi", "uk",
     "cs", "da", "fi", "no", "sv", "el", "he", "th",
     "ta",   # Tamil
+    "hi",   # Hindi
+    "te",   # Telugu
+    "ur",   # Urdu
     "tgl",  # Tanglish (romanised Tamil in Latin script)
 }
 
@@ -52,7 +91,10 @@ LANGUAGE_NAMES = {
     "tr": "Turkish", "pl": "Polish", "vi": "Vietnamese", "uk": "Ukrainian",
     "cs": "Czech", "da": "Danish", "fi": "Finnish", "no": "Norwegian",
     "sv": "Swedish", "el": "Greek", "he": "Hebrew", "th": "Thai",
-    "ta": "Tamil",
+    "ta":  "Tamil",
+    "hi":  "Hindi",
+    "te":  "Telugu",
+    "ur":  "Urdu",
     "tgl": "Tanglish",
 }
 
@@ -84,11 +126,12 @@ MARIAN_MODELS = {
 }
 
 # ── NLLB-200 language code mapping ───────────────────────────────────────────
-# facebook/nllb-200-distilled-600M uses BCP-47 script-tagged codes, not ISO 639-1.
-# Any language pair listed here is routed to NLLB instead of M2M100.
-# NLLB is the correct choice for Tamil: it was trained on Tamil script (tam_Taml)
-# and produces accurate, fluent translations — unlike opus-mt-en-mul.
-NLLB_MODEL = "facebook/nllb-200-distilled-600M"
+# P2/P5 FIX: Upgrade to nllb-200-distilled-1.3B for Indic languages (hi/te/ur/ta).
+# The 600M model produces grammatically broken Tamil/Hindi (broken verb phrases,
+# wrong word order). The 1.3B model has significantly better Indic language quality.
+# Falls back to 600M if the 1.3B model is not available (OOM on small GPUs).
+NLLB_MODEL         = "facebook/nllb-200-distilled-1.3B"
+NLLB_MODEL_FALLBACK = "facebook/nllb-200-distilled-600M"
 
 NLLB_LANG_CODES: Dict[str, str] = {
     "en":  "eng_Latn",
@@ -103,7 +146,9 @@ NLLB_LANG_CODES: Dict[str, str] = {
     "ja":  "jpn_Jpan",
     "ko":  "kor_Hang",
     "ar":  "arb_Arab",
-    "hi":  "hin_Deva",
+    "hi":  "hin_Deva",   # Hindi — Devanagari script
+    "te":  "tel_Telu",   # Telugu — Telugu script  (P5 FIX)
+    "ur":  "urd_Arab",   # Urdu   — Nastaliq/Arabic script  (P5 FIX)
     "tr":  "tur_Latn",
     "pl":  "pol_Latn",
     "vi":  "vie_Latn",
@@ -116,7 +161,7 @@ NLLB_LANG_CODES: Dict[str, str] = {
     "el":  "ell_Grek",
     "he":  "heb_Hebr",
     "th":  "tha_Thai",
-    "ta":  "tam_Taml",   # Tamil — correct NLLB script tag, produces Tamil script ✓
+    "ta":  "tam_Taml",   # Tamil — correct NLLB script tag ✓
 }
 
 # Language pairs that MUST use NLLB (Tamil + any pair not in MARIAN_MODELS).
@@ -132,7 +177,12 @@ def _needs_nllb(src: str, tgt: str) -> bool:
 
 
 # ── M2M100 fallback (for pairs not covered by Marian or NLLB) ────────────────
-M2M100_MODEL = "facebook/m2m100_418M"
+import re as _re
+
+# P1 FIX: Pre-compiled pattern to strip any leading [...] block that the model
+# echoed back.  The simple str.replace used previously failed because NLLB
+# sometimes adds Unicode spacing or changes bracket characters during decode.
+_HINT_ECHO_RE = _re.compile(r'^\s*\[.*?\]\s*', _re.DOTALL)
 
 # Translation parameters
 MAX_INPUT_LENGTH = 512
@@ -176,6 +226,13 @@ class TimedTranslationRequest(BaseModel):
     beam_size: int = Field(DEFAULT_BEAM_SIZE, ge=1, le=10, description="Beam search size")
     batch_size: int = Field(16, ge=1, le=MAX_BATCH_SIZE, description="Batch processing size")
 
+    # S3 output — optional. When output_bucket is provided the translated JSON
+    # is uploaded to S3 and the response includes output_bucket / output_key.
+    output_bucket:     Optional[str] = Field(None, max_length=63,
+                                             description="S3 bucket to save the translated JSON")
+    output_key_prefix: Optional[str] = Field("translations/",
+                                             description="S3 key prefix for the output file")
+
     @validator('source_lang', 'target_lang')
     def validate_language(cls, v):
         v = v.lower()
@@ -213,6 +270,12 @@ class SimpleTranslationRequest(BaseModel):
     source_lang: str = Field(..., min_length=2, max_length=5)
     target_lang: str = Field(..., min_length=2, max_length=5)
     beam_size: int = Field(DEFAULT_BEAM_SIZE, ge=1, le=10)
+
+    # S3 output — optional
+    output_bucket:     Optional[str] = Field(None, max_length=63,
+                                             description="S3 bucket to save the translated JSON")
+    output_key_prefix: Optional[str] = Field("translations/",
+                                             description="S3 key prefix for the output file")
 
     @validator('source_lang', 'target_lang')
     def validate_language(cls, v):
@@ -255,6 +318,9 @@ class TimedTranslationResponse(BaseModel):
     processing_time_seconds: float
     device: str
     model_type: str
+    # S3 output fields — None when output_bucket was not requested
+    output_bucket: Optional[str] = None
+    output_key:    Optional[str] = None
     message: str
 
 
@@ -268,6 +334,10 @@ class SimpleTranslationResponse(BaseModel):
     processing_time_seconds: float
     device: str
     model_type: str
+    confidence: Optional[float] = None   # P4 FIX: real sequence confidence score
+    # S3 output fields — None when output_bucket was not requested
+    output_bucket: Optional[str] = None
+    output_key:    Optional[str] = None
 
 
 # =====================================================
@@ -323,24 +393,22 @@ class ModelManager:
 
             logger.info(f"Loading translation model for {key}")
 
-            try:
+            # FIX: Define a synchronous loader to run in a thread pool,
+            # so the heavy HuggingFace from_pretrained() calls never block
+            # the async event loop (which caused VS Code / server freezes).
+            def _sync_load_model():
                 if key in MARIAN_MODELS:
-                    # ── Marian (fast, specific pairs) ─────────────────────
                     model_name = MARIAN_MODELS[key]
-                    tokenizer = MarianTokenizer.from_pretrained(
+                    tok = MarianTokenizer.from_pretrained(
                         model_name, cache_dir=MODEL_CACHE_DIR
                     )
-                    model = MarianMTModel.from_pretrained(
+                    mdl = MarianMTModel.from_pretrained(
                         model_name, cache_dir=MODEL_CACHE_DIR
                     )
-                    forced_bos = None
-                    model_type = "marian"
                     logger.info(f"Loaded Marian model: {model_name}")
+                    return mdl, tok, None, "marian"
 
                 elif _needs_nllb(src, tgt):
-                    # ── NLLB-200 (Tamil, Arabic, CJK, 200 languages) ──────
-                    # FIX: Tamil must use NLLB — opus-mt-en-mul cannot produce
-                    # Tamil script and returns empty/garbled strings.
                     nllb_src = NLLB_LANG_CODES.get(src)
                     nllb_tgt = NLLB_LANG_CODES.get(tgt)
                     if not nllb_src or not nllb_tgt:
@@ -348,35 +416,53 @@ class ModelManager:
                             f"No NLLB language code for '{src}' or '{tgt}'. "
                             f"Add entries to NLLB_LANG_CODES."
                         )
-                    tokenizer = AutoTokenizer.from_pretrained(
-                        NLLB_MODEL,
-                        cache_dir=MODEL_CACHE_DIR,
-                        src_lang=nllb_src,
-                    )
-                    model = AutoModelForSeq2SeqLM.from_pretrained(
-                        NLLB_MODEL, cache_dir=MODEL_CACHE_DIR
-                    )
-                    # forced_bos_token_id tells the decoder which language to generate
-                    forced_bos = tokenizer.convert_tokens_to_ids(nllb_tgt)
-                    model_type = "nllb"
+
+                    def _load_nllb(model_id: str):
+                        tok = AutoTokenizer.from_pretrained(
+                            model_id, cache_dir=MODEL_CACHE_DIR, src_lang=nllb_src,
+                        )
+                        mdl = AutoModelForSeq2SeqLM.from_pretrained(
+                            model_id, cache_dir=MODEL_CACHE_DIR
+                        )
+                        return tok, mdl
+
+                    try:
+                        tok, mdl = _load_nllb(NLLB_MODEL)
+                        nllb_model_used = NLLB_MODEL
+                    except (RuntimeError, Exception) as oom_err:
+                        if "out of memory" in str(oom_err).lower() or "cuda" in str(oom_err).lower():
+                            logger.warning(
+                                f"NLLB 1.3B OOM ({oom_err}); falling back to 600M model"
+                            )
+                            tok, mdl = _load_nllb(NLLB_MODEL_FALLBACK)
+                            nllb_model_used = NLLB_MODEL_FALLBACK
+                        else:
+                            raise
+
+                    fbs = tok.convert_tokens_to_ids(nllb_tgt)
                     logger.info(
-                        f"Loaded NLLB-200 model for {src}({nllb_src}) → "
-                        f"{tgt}({nllb_tgt}), forced_bos={forced_bos}"
+                        f"Loaded NLLB model '{nllb_model_used}' for "
+                        f"{src}({nllb_src}) → {tgt}({nllb_tgt}), forced_bos={fbs}"
                     )
+                    return mdl, tok, fbs, "nllb"
 
                 else:
-                    # ── M2M100 fallback ───────────────────────────────────
-                    tokenizer = M2M100Tokenizer.from_pretrained(
+                    tok = M2M100Tokenizer.from_pretrained(
                         M2M100_MODEL, cache_dir=MODEL_CACHE_DIR
                     )
-                    model = M2M100ForConditionalGeneration.from_pretrained(
+                    mdl = M2M100ForConditionalGeneration.from_pretrained(
                         M2M100_MODEL, cache_dir=MODEL_CACHE_DIR
                     )
-                    tokenizer.src_lang = src
-                    forced_bos = tokenizer.get_lang_id(tgt)
-                    model_type = "m2m100"
+                    tok.src_lang = src
+                    fbs = tok.get_lang_id(tgt)
                     logger.info(f"Loaded M2M100 model for {src}→{tgt}")
+                    return mdl, tok, fbs, "m2m100"
 
+            try:
+                # FIX: Run the blocking load in a thread pool — never on the event loop
+                model, tokenizer, forced_bos, model_type = await asyncio.to_thread(
+                    _sync_load_model
+                )
                 model.to(DEVICE).eval()
                 self._model_cache[key] = (model, tokenizer, forced_bos)
                 logger.info(f"Successfully loaded and cached model for {key}")
@@ -418,10 +504,19 @@ model_manager = ModelManager()
 # unexpected tokens, which in turn makes the model output empty strings.
 # The translate_batch function checks model_type before applying hints.
 TRANSLATION_STYLE_HINTS: Dict[str, str] = {
-    "ko": "[casual energetic conversational Korean 해체, preserve exclamations and emotion] ",
-    "ja": "[casual conversational Japanese ため口, match energy and emotion of source] ",
-    "zh": "[natural conversational Mandarin, match energy and emotion of source] ",
-    "ta": "[natural conversational Tamil, colloquial register, match energy and emotion of source] ",
+    "ko":  "[casual energetic conversational Korean 해체, preserve exclamations and emotion] ",
+    "ja":  "[casual conversational Japanese ため口, match energy and emotion of source] ",
+    "zh":  "[natural conversational Mandarin, match energy and emotion of source] ",
+    # P2 FIX: improved Tamil hint — explicitly requests correct verb agreement and
+    # natural sentence order, which the 600M model was ignoring.
+    "ta":  "[natural fluent Tamil with correct verb agreement and word order, "
+           "colloquial spoken register, match energy and emotion of source] ",
+    "hi":  "[natural conversational Hindi, correct verb agreement, colloquial Hindustani "
+           "register, match energy and emotion of source] ",
+    "te":  "[natural conversational Telugu, correct verb agreement and agglutinative "
+           "morphology, colloquial register, match energy and emotion of source] ",
+    "ur":  "[natural conversational Urdu, correct verb agreement, colloquial register, "
+           "match energy and emotion of source] ",
     "tgl": (
         "[Tanglish: romanised Tamil mixed with English, casual colloquial, "
         "write Tamil words in Latin script, match energy and emotion of source] "
@@ -437,31 +532,27 @@ async def translate_batch(
     src: str,
     tgt: str,
     beam_size: int = DEFAULT_BEAM_SIZE,
-) -> Tuple[List[str], str]:
+) -> Tuple[List[str], str, List[Optional[float]]]:
     """
     Translate a batch of texts using the best available model for the language pair.
+    Returns (translations, model_type, confidences).
 
     Engine routing:
       • Marian  → fast European pairs (NO style hints — breaks SentencePiece tokenizer)
-      • NLLB    → Tamil, Arabic, CJK, 200-language coverage (style hints safe here)
-      • M2M100  → generic fallback (style hints safe here)
+      • NLLB    → Indic, Tamil, Arabic, CJK, 200-language coverage (style hints safe)
+      • M2M100  → generic fallback (style hints safe)
 
-    Tanglish normalisation:
-      "tgl" has no model token.  We route it as "en" so the model uses its English
-      vocabulary for Latin-script output; the style hint steers register to Tanglish.
+    P1 FIX — style hint echo: regex-based [...] prefix stripping replaces the
+      broken str.replace approach that failed when NLLB changed spacing/brackets.
 
-    FIX — empty Tamil translations:
-      The previous code mapped "en-ta" to Helsinki-NLP/opus-mt-en-mul, which is a
-      multilingual Marian model with very poor Tamil support.  It produced empty
-      strings or romanised gibberish.  Tamil is now routed to NLLB-200 which was
-      explicitly trained on tam_Taml and reliably produces Tamil script output.
+    P2 FIX — grammar quality: upgraded to NLLB-1.3B for Indic language pairs.
 
-    FIX — style hint breaking Marian:
-      Style hints are now gated behind `if model_type != "marian"` so they are
-      never prepended to Marian inputs.
+    P4 FIX — confidence scores: output_scores=True + return_dict_in_generate=True
+      lets us compute a real mean-token log-prob per sequence and convert it to a
+      probability in [0, 1], replacing the always-null confidence field.
     """
     if not texts:
-        return [], "none"
+        return [], "none", []
 
     # Normalise Tanglish → English for model routing; style hint handles register
     model_src = "en" if src == "tgl" else src
@@ -507,17 +598,50 @@ async def translate_batch(
                 max_length=MAX_OUTPUT_LENGTH,
                 early_stopping=True,
                 no_repeat_ngram_size=3,
+                # P4 FIX: return sequence-level scores so we can compute a
+                # real confidence value instead of always returning None.
+                # output_scores=True returns per-step token logits;
+                # return_dict_in_generate=True wraps them in a named dict.
+                output_scores=True,
+                return_dict_in_generate=True,
             )
             if forced_bos is not None:
                 generate_kwargs["forced_bos_token_id"] = forced_bos
 
-            generated = model.generate(**generate_kwargs)
+            # FIX: Offload blocking model.generate() to thread pool so the
+            # async event loop stays free during inference (prevents server freeze).
+            outputs = await asyncio.to_thread(model.generate, **generate_kwargs)
+
+        # Extract sequence ids and scores
+        generated     = outputs.sequences
+        # sequences_scores: mean log-prob per generated token for each beam-best sequence.
+        # Shape: (batch_size,).  Convert log-prob → probability in [0, 1].
+        seq_scores_raw = outputs.sequences_scores  # log-probs, typically negative floats
+        # Normalise to [0, 1]: e^(score) where score ≈ mean token log-prob.
+        # A mean log-prob of 0 means every token was assigned probability 1 (perfect).
+        # A mean log-prob of -5 means average token prob ≈ e^-5 ≈ 0.007 (very uncertain).
+        # We clamp to [0, 1] to handle edge cases.
+        confidences: List[Optional[float]] = []
+        if seq_scores_raw is not None:
+            try:
+                for score in seq_scores_raw.cpu().float().tolist():
+                    prob = float(torch.exp(torch.tensor(score)).clamp(0.0, 1.0))
+                    confidences.append(round(prob, 4))
+            except Exception:
+                confidences = [None] * len(generated)
+        else:
+            confidences = [None] * len(generated)
 
         translations = tokenizer.batch_decode(generated, skip_special_tokens=True)
 
-        # Strip style hint echo if model leaked it into the output
+        # P1 FIX — Style hint echo removal (see comment above)
         if style_hint:
-            translations = [t.replace(style_hint.strip(), "").strip() for t in translations]
+            translations = [_HINT_ECHO_RE.sub("", t).strip() for t in translations]
+            translations = [
+                _re.sub(r'^[\[【「『\s]*[^\]】」』\u0B80-\u0BFF]{0,120}[\]】」』]\s*', '', t).strip()
+                if t.startswith(('[', '【', '「', '『')) else t
+                for t in translations
+            ]
 
         # Safety check: if any translation is empty, log a warning
         empty_count = sum(1 for t in translations if not t.strip())
@@ -527,7 +651,11 @@ async def translate_batch(
                 f"for {src}→{tgt} using {model_type}. Check model coverage."
             )
 
-        return translations, model_type
+        # Pad confidences list to match translations length (safety)
+        while len(confidences) < len(translations):
+            confidences.append(None)
+
+        return translations, model_type, confidences
 
     except Exception as e:
         logger.error(f"Translation failed for {src}→{tgt}: {e}", exc_info=True)
@@ -539,6 +667,61 @@ async def translate_batch(
 
 def split_into_batches(items: List[Any], batch_size: int) -> List[List[Any]]:
     return [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
+
+
+def _upload_translation_to_s3(
+    payload: dict,
+    bucket: str,
+    key_prefix: str,
+    job_id: str,
+) -> str:
+    """
+    Serialise `payload` to JSON and upload to S3.
+    Returns the S3 key.  Raises HTTPException(500) on failure.
+    """
+    if not S3_ENABLED or s3_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="S3 not configured – set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION",
+        )
+
+    key = f"{key_prefix.rstrip('/')}/{job_id}.json"
+    local_path = str(TEMP_DIR / f"{job_id}_translation.json")
+
+    try:
+        with open(local_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+        s3_client.upload_file(
+            local_path,
+            bucket,
+            key,
+            ExtraArgs={
+                "ContentType":          "application/json; charset=utf-8",
+                "ServerSideEncryption": "AES256",
+                "Metadata": {
+                    "job_id":       job_id,
+                    "content_type": "translation",
+                    "timestamp":    datetime.utcnow().isoformat(),
+                },
+            },
+        )
+        logger.info(f"Translation saved to s3://{bucket}/{key}")
+        return key
+
+    except ClientError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"S3 upload failed: {e.response['Error']['Message']}",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Translation S3 upload failed: {e}")
+    finally:
+        try:
+            if os.path.exists(local_path):
+                os.remove(local_path)
+        except OSError:
+            pass
 
 
 # =====================================================
@@ -563,24 +746,29 @@ async def translate_timed(request: TimedTranslationRequest) -> TimedTranslationR
     try:
         texts = [seg.text for seg in request.segments]
         batches = split_into_batches(texts, request.batch_size)
-        all_translations: List[str] = []
+        all_translations: List[str]          = []
+        all_confidences:  List[Optional[float]] = []
         model_type = None
 
         for i, batch in enumerate(batches):
             logger.debug(f"Processing batch {i+1}/{len(batches)}")
-            # Run translation in executor to avoid blocking the event loop
-            translations, mt = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda b=batch: asyncio.run(translate_batch(
-                    b,
-                    request.source_lang,
-                    request.target_lang,
-                    request.beam_size,
-                ))
+            # FIX: Call translate_batch directly — no nested asyncio.run() or
+            # run_in_executor needed. Blocking work is handled inside load_model
+            # via asyncio.to_thread, keeping the event loop free.
+            translations, mt, confs = await translate_batch(
+                batch,
+                request.source_lang,
+                request.target_lang,
+                request.beam_size,
             )
             all_translations.extend(translations)
+            all_confidences.extend(confs)
             if model_type is None:
                 model_type = mt
+
+        # Pad confidences if shorter than translations (safety)
+        while len(all_confidences) < len(all_translations):
+            all_confidences.append(None)
 
         translated_segments = [
             TranslatedSegment(
@@ -589,9 +777,11 @@ async def translate_timed(request: TimedTranslationRequest) -> TimedTranslationR
                 end=seg.end,
                 source_text=seg.text,
                 translated_text=translated_text,
-                confidence=None,
+                confidence=conf,   # P4 FIX: real confidence, not always None
             )
-            for seg, translated_text in zip(request.segments, all_translations)
+            for seg, translated_text, conf in zip(
+                request.segments, all_translations, all_confidences
+            )
         ]
 
         processing_time = time.time() - start_time
@@ -599,6 +789,39 @@ async def translate_timed(request: TimedTranslationRequest) -> TimedTranslationR
             f"Job {job_id} completed in {processing_time:.2f}s — "
             f"{len(translated_segments)} segments translated via {model_type}"
         )
+
+        # ── S3 upload (when output_bucket is provided) ────────────────────
+        output_bucket_out: Optional[str] = None
+        output_key_out:    Optional[str] = None
+
+        if request.output_bucket:
+            s3_payload = {
+                "job_id":          job_id,
+                "source_language": request.source_lang,
+                "target_language": request.target_lang,
+                "model_type":      model_type or "unknown",
+                "segments_count":  len(translated_segments),
+                "processing_time_seconds": round(processing_time, 2),
+                "timestamp":       datetime.utcnow().isoformat(),
+                "segments": [
+                    {
+                        "index":           seg.index,
+                        "start":           seg.start,
+                        "end":             seg.end,
+                        "source_text":     seg.source_text,
+                        "translated_text": seg.translated_text,
+                        "confidence":      seg.confidence,
+                    }
+                    for seg in translated_segments
+                ],
+            }
+            output_key_out = _upload_translation_to_s3(
+                s3_payload,
+                request.output_bucket,
+                request.output_key_prefix or "translations/",
+                job_id,
+            )
+            output_bucket_out = request.output_bucket
 
         return TimedTranslationResponse(
             success=True,
@@ -610,7 +833,13 @@ async def translate_timed(request: TimedTranslationRequest) -> TimedTranslationR
             processing_time_seconds=round(processing_time, 2),
             device=DEVICE,
             model_type=model_type or "unknown",
-            message=f"Successfully translated {len(translated_segments)} segments"
+            output_bucket=output_bucket_out,
+            output_key=output_key_out,
+            message=(
+                f"Successfully translated {len(translated_segments)} segments"
+                + (f" — saved to s3://{output_bucket_out}/{output_key_out}"
+                   if output_key_out else "")
+            ),
         )
 
     except HTTPException:
@@ -640,7 +869,8 @@ async def translate_text(request: SimpleTranslationRequest) -> SimpleTranslation
     )
 
     try:
-        translations, model_type = await translate_batch(
+        # P4 FIX: translate_batch now returns (translations, model_type, confidences)
+        translations, model_type, confs = await translate_batch(
             [request.text],
             request.source_lang,
             request.target_lang,
@@ -648,9 +878,38 @@ async def translate_text(request: SimpleTranslationRequest) -> SimpleTranslation
         )
 
         translated_text = translations[0] if translations else ""
+        confidence      = confs[0] if confs else None
         processing_time = time.time() - start_time
 
-        logger.info(f"Translation completed in {processing_time:.2f}s via {model_type}")
+        logger.info(
+            f"Translation completed in {processing_time:.2f}s via {model_type}"
+            + (f" | confidence={confidence:.4f}" if confidence is not None else "")
+        )
+
+        # ── S3 upload (when output_bucket is provided) ────────────────────
+        output_bucket_out: Optional[str] = None
+        output_key_out:    Optional[str] = None
+
+        if request.output_bucket:
+            s3_payload = {
+                "job_id":          str(uuid.uuid4()),
+                "source_language": request.source_lang,
+                "target_language": request.target_lang,
+                "model_type":      model_type,
+                "source_text":     request.text,
+                "translated_text": translated_text,
+                "confidence":      confidence,
+                "processing_time_seconds": round(processing_time, 2),
+                "timestamp":       datetime.utcnow().isoformat(),
+            }
+            _job_id = s3_payload["job_id"]
+            output_key_out = _upload_translation_to_s3(
+                s3_payload,
+                request.output_bucket,
+                request.output_key_prefix or "translations/",
+                _job_id,
+            )
+            output_bucket_out = request.output_bucket
 
         return SimpleTranslationResponse(
             success=True,
@@ -661,6 +920,9 @@ async def translate_text(request: SimpleTranslationRequest) -> SimpleTranslation
             processing_time_seconds=round(processing_time, 2),
             device=DEVICE,
             model_type=model_type,
+            confidence=confidence,
+            output_bucket=output_bucket_out,
+            output_key=output_key_out,
         )
 
     except Exception as e:

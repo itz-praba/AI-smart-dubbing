@@ -105,12 +105,15 @@ MODEL_CACHE_DIR = os.getenv("MODEL_CACHE_DIR", "./models")
 # join-seams in the audio.  We use a per-language table and fall back to 200
 # for all other languages.
 LANG_CHUNK_CHARS: Dict[str, int] = {
-    "ko": 120,   # Korean — agglutinative, ~1.5-2× phoneme density vs English
-    "ja": 100,   # Japanese — similar density
-    "zh": 80,    # Chinese — character-dense
-    "ar": 150,   # Arabic — morphologically rich
-    "ta": 130,   # Tamil — agglutinative Dravidian, longer compound words
-    "tgl": 200,  # Tanglish — Latin script, similar density to English
+    "ko":  120,   # Korean — agglutinative, ~1.5-2× phoneme density vs English
+    "ja":  100,   # Japanese — similar density
+    "zh":   80,   # Chinese — character-dense
+    "ar":  150,   # Arabic — morphologically rich
+    "ta":  130,   # Tamil — agglutinative Dravidian, longer compound words
+    "hi":  140,   # Hindi — Devanagari, moderate density
+    "te":  130,   # Telugu — agglutinative, similar to Tamil
+    "ur":  140,   # Urdu — similar to Hindi
+    "tgl": 200,   # Tanglish — Latin script, similar density to English
 }
 MAX_CHUNK_CHARS = 200  # default for Latin-script languages
 

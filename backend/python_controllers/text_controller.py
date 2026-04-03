@@ -38,7 +38,10 @@ ALLOWED_AUDIO_EXTENSIONS = {'.wav', '.mp3', '.m4a', '.flac', '.ogg', '.opus', '.
 SUPPORTED_LANGUAGES = [
     'en', 'es', 'fr', 'de', 'it', 'pt', 'nl', 'ru', 'zh', 'ja', 'ko',
     'ar', 'hi', 'tr', 'pl', 'cs', 'sv', 'da', 'fi', 'no', 'uk', 'vi',
+    'el', 'he', 'th',
     'ta',   # Tamil
+    'te',   # Telugu   — Whisper large-v3 supports natively
+    'ur',   # Urdu     — Whisper large-v3 supports natively
     'tgl',  # Tanglish (romanised Tamil; Whisper transcribes as English phonetics)
 ]
 
@@ -60,9 +63,10 @@ REQUIRED_ENV_VARS = [
     "AWS_REGION"
 ]
 
-for env_var in REQUIRED_ENV_VARS:
-    if not os.getenv(env_var):
-        raise RuntimeError(f"Missing required environment variable: {env_var}")
+# BUG FIX 1: warn instead of crash — lets server start without S3 in dev/test
+_missing_env = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
+for _v in _missing_env:
+    logger.warning(f"Missing environment variable: {_v} – S3 features will be disabled")
 
 # HuggingFace token for speaker diarization
 HUGGINGFACE_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
@@ -72,31 +76,34 @@ if not HUGGINGFACE_TOKEN:
 # =====================================================
 # AWS S3 CLIENT
 # =====================================================
-try:
-    from botocore.config import Config
-    
-    boto_config = Config(
-        retries={
-            'max_attempts': 3,
-            'mode': 'standard'
-        },
-        connect_timeout=10,
-        read_timeout=120
-    )
-    
-    s3_client = boto3.client(
-        "s3",
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-        region_name=os.getenv("AWS_REGION"),
-        config=boto_config
-    )
-    
-    s3_client.list_buckets()
-    logger.info("S3 client initialized successfully")
-    
-except Exception as e:
-    raise RuntimeError(f"Failed to initialize S3 client: {str(e)}")
+# BUG FIX 2: graceful init — never crash at module import time
+S3_ENABLED = not bool(_missing_env)
+s3_client   = None
+
+if S3_ENABLED:
+    try:
+        from botocore.config import Config
+        
+        boto_config = Config(
+            retries={'max_attempts': 3, 'mode': 'standard'},
+            connect_timeout=10,
+            read_timeout=120
+        )
+        
+        s3_client = boto3.client(
+            "s3",
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+            region_name=os.getenv("AWS_REGION"),
+            config=boto_config
+        )
+        
+        s3_client.list_buckets()
+        logger.info("S3 client initialized successfully")
+        
+    except Exception as e:
+        logger.warning(f"S3 client init failed ({e}) – S3 features disabled")
+        S3_ENABLED = False
 
 # =====================================================
 # DEVICE CONFIGURATION
@@ -108,12 +115,24 @@ logger.info(f"Using device: {device}, compute type: {compute_type}")
 # =====================================================
 # MODEL MANAGEMENT (Lazy Loading)
 # =====================================================
-_whisper_model = None
+_whisper_model       = None
+_whisper_model_size  = None   # FIX P4: track which size is loaded
 _diarization_pipeline = None
 
 def get_whisper_model(model_size: str = "large-v3") -> WhisperModel:
-    global _whisper_model
-    
+    global _whisper_model, _whisper_model_size
+
+    # FIX P4: if a different model size is requested, discard the cached model
+    # and load the correct one. Previously every call after the first returned
+    # the cached model regardless of the requested size.
+    if _whisper_model is not None and _whisper_model_size != model_size:
+        logger.info(
+            f"Model size changed ({_whisper_model_size} → {model_size}); "
+            f"reloading Whisper model"
+        )
+        _whisper_model      = None
+        _whisper_model_size = None
+
     if _whisper_model is None:
         try:
             logger.info(f"Loading Whisper model: {model_size} on {device}")
@@ -124,11 +143,12 @@ def get_whisper_model(model_size: str = "large-v3") -> WhisperModel:
                 download_root="./models",
                 num_workers=4 if device == "cuda" else 2
             )
+            _whisper_model_size = model_size
             logger.info("Whisper model loaded successfully")
         except Exception as e:
             logger.error(f"Failed to load Whisper model: {e}")
             raise RuntimeError(f"Failed to initialize Whisper model: {str(e)}")
-    
+
     return _whisper_model
 
 
@@ -142,10 +162,18 @@ def get_diarization_pipeline() -> Optional[Pipeline]:
     if _diarization_pipeline is None:
         try:
             logger.info("Loading speaker diarization pipeline")
-            _diarization_pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                use_auth_token=HUGGINGFACE_TOKEN
-            )
+            # BUG FIX 6: pyannote ≥3.x uses token= not use_auth_token= (deprecated)
+            try:
+                _diarization_pipeline = Pipeline.from_pretrained(
+                    "pyannote/speaker-diarization-3.1",
+                    token=HUGGINGFACE_TOKEN
+                )
+            except TypeError:
+                # Fallback for pyannote <3.x installs that still use the old kwarg
+                _diarization_pipeline = Pipeline.from_pretrained(
+                    "pyannote/speaker-diarization-3.1",
+                    use_auth_token=HUGGINGFACE_TOKEN
+                )
             
             if device == "cuda":
                 _diarization_pipeline.to(torch.device("cuda"))
@@ -174,11 +202,48 @@ class SpeechToTextRequest(BaseModel):
     audio_bucket: str = Field(..., min_length=1, max_length=63)
     audio_key: str = Field(..., min_length=1, max_length=1024)
     output_bucket: str = Field(..., min_length=1, max_length=63)
+    # BUG FIX 7: expose output_key_prefix so the pipeline can control
+    # where the transcript JSON is stored (previously hardcoded to "transcripts/")
+    output_key_prefix: Optional[str] = Field(
+        "transcripts/",
+        max_length=512,
+        description="S3 prefix for output transcript. Default: 'transcripts/'"
+    )
     language: Optional[str] = Field(None, description="ISO language code (e.g., 'en', 'es')")
     diarize: bool = Field(True, description="Perform speaker diarization")
     model_size: str = Field("large-v3", description="Whisper model size")
     word_timestamps: bool = Field(True, description="Include word-level timestamps")
+
+    # VAD controls — exposed so callers can override when audio is being truncated
+    vad_filter: bool = Field(
+        False,
+        description=(
+            "Enable Silero VAD pre-filtering. "
+            "DEFAULT IS NOW FALSE because VAD was silently dropping the last 2–3s "
+            "of speech in short dubbing clips (energy fade-out at sentence end scored "
+            "below threshold). "
+            "Set to True only for long recordings with significant silence sections "
+            "(podcasts, lectures, interviews). "
+            "For dubbing source clips, always leave False."
+        )
+    )
+    vad_threshold: float = Field(
+        0.15,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Silero VAD speech probability threshold (only used when vad_filter=True). "
+            "0.15 = maximum recall — only pure silence is filtered. "
+            "Raise toward 0.5 only for very noisy recordings."
+        )
+    )
     
+    @validator('output_key_prefix')
+    def validate_output_prefix(cls, v):
+        if v is not None and ('..' in v or v.startswith('/')):
+            raise ValueError("Invalid output prefix: path traversal detected")
+        return v
+
     @validator('audio_bucket', 'output_bucket')
     def validate_bucket_name(cls, v):
         if not v.replace('-', '').replace('.', '').isalnum():
@@ -210,12 +275,17 @@ class SpeechToTextRequest(BaseModel):
     
     @validator('model_size')
     def validate_model_size(cls, v):
-        if v not in WHISPER_MODELS.values():
-            raise ValueError(
-                f"Invalid model size '{v}'. "
-                f"Available: {', '.join(WHISPER_MODELS.keys())}"
-            )
-        return v
+        # BUG FIX 4 & 5: accept both friendly keys ("large") and canonical values
+        # ("large-v3"). Normalise to the canonical model name here so
+        # get_whisper_model() always receives a value WhisperModel accepts.
+        if v in WHISPER_MODELS:
+            return WHISPER_MODELS[v]   # "large" → "large-v3", "base" → "base" etc.
+        if v in WHISPER_MODELS.values():
+            return v                   # already canonical ("large-v3")
+        raise ValueError(
+            f"Invalid model size '{v}'. "
+            f"Available: {', '.join(list(WHISPER_MODELS.keys()) + list(WHISPER_MODELS.values()))}"
+        )
 
 
 class SpeechToTextResponse(BaseModel):
@@ -348,7 +418,13 @@ def upload_to_s3(local_path: str, bucket: str, key: str, metadata: dict = None) 
         raise HTTPException(status_code=500, detail=f"Unexpected error during upload: {str(e)}")
 
 
-def perform_diarization(audio_path: str) -> List[Dict[str, Any]]:
+def perform_diarization(audio_path: str) -> tuple:
+    """
+    Run pyannote speaker diarization.
+    BUG FIX 10: returns (segments, success_bool) instead of silently swallowing
+    failures. The endpoint logs a warning and continues without diarization when
+    success=False, but the fact is surfaced in the response metadata.
+    """
     speaker_segments = []
 
     try:
@@ -356,7 +432,7 @@ def perform_diarization(audio_path: str) -> List[Dict[str, Any]]:
 
         if diarization_pipeline is None:
             logger.warning("Diarization pipeline not available")
-            return speaker_segments
+            return speaker_segments, False
 
         logger.info("Starting speaker diarization")
         diarization = diarization_pipeline(audio_path)
@@ -372,75 +448,184 @@ def perform_diarization(audio_path: str) -> List[Dict[str, Any]]:
             f"Diarization complete: {len(speaker_segments)} segments, "
             f"{len(set(s['speaker'] for s in speaker_segments))} unique speakers"
         )
+        return speaker_segments, True
 
     except Exception as e:
         logger.error(f"Diarization failed: {e}", exc_info=True)
+        return speaker_segments, False
 
-    return speaker_segments
+
+# BUG FIX 8: language-specific initial prompts so Whisper is grounded in the
+# right script/vocabulary from the first segment rather than defaulting to English.
+_INITIAL_PROMPTS: Dict[str, str] = {
+    "hi": "यह एक स्पष्ट हिंदी भाषण रिकॉर्डिंग है।",
+    "te": "ఇది స్పష్టమైన తెలుగు మాట్లాడే రికార్డింగ్.",
+    "ur": "یہ ایک واضح اردو تقریر کی ریکارڈنگ ہے۔",
+    "ta": "இது ஒரு தெளிவான தமிழ் பேச்சு பதிவு.",
+    "ar": "هذا تسجيل صوتي واضح باللغة العربية.",
+    "zh": "这是一段清晰的普通话录音。",
+    "ja": "これは明瞭な日本語の音声録音です。",
+    "ko": "이것은 명확한 한국어 음성 녹음입니다.",
+    "ru": "Это чёткая запись речи на русском языке.",
+}
+
+
+def _get_audio_duration(audio_path: str) -> float:
+    """
+    Return the actual duration of an audio file in seconds using librosa.
+    Used to detect and log VAD truncation gaps (FIX P7).
+    Falls back to 0.0 if the file cannot be read.
+    """
+    try:
+        import librosa
+        duration = librosa.get_duration(path=audio_path)
+        return float(duration)
+    except Exception:
+        try:
+            # Fallback: soundfile
+            import soundfile as sf
+            with sf.SoundFile(audio_path) as f:
+                return len(f) / f.samplerate
+        except Exception:
+            return 0.0
 
 
 def transcribe_audio(
     audio_path: str,
     language: Optional[str] = None,
     model_size: str = "large-v3",
-    word_timestamps: bool = True
+    word_timestamps: bool = True,
+    vad_filter: bool = False,    # P3 FIX: default OFF — prevents end-of-clip truncation
+    vad_threshold: float = 0.15, # P3 FIX: lower threshold when VAD is used
 ) -> tuple:
     """
-    FIX #1 — TRANSCRIPTION ACCURACY:
-    - Removed aggressive VAD (min_silence_duration_ms=500) which was causing short
-      utterances and fast speech to be dropped entirely.
-    - temperature is now a list [0.0, 0.2, 0.4] so Whisper can retry with higher
-      temperature when it detects decoding failure, instead of producing blank/hallucinated segments.
-    - condition_on_previous_text=True helps keep coherent context across segments.
-    - compression_ratio_threshold and log_prob_threshold guard against hallucinations.
-    - no_speech_threshold lowered slightly so soft speech is not silently dropped.
-    - initial_prompt seeds common vocabulary so the model is less likely to transcribe
-      silence as repetitive filler words.
+    Transcribe audio using Faster-Whisper with VAD settings tuned for
+    maximum recall — ensuring no speech is silently dropped.
+
+    ── Why audio was being truncated (root causes) ──────────────────────────
+
+    FIX P1 — VAD threshold too high (was 0.35, now 0.20):
+        Silero VAD scores each 30ms chunk with a speech probability [0,1].
+        A threshold of 0.35 — even though lower than the default 0.5 — is
+        still high enough to drop:
+          • speech at the end of a sentence (energy naturally falls off)
+          • accented/non-English phonemes with lower activation scores
+          • soft speakers and whispered segments
+          • the last 2–4 seconds of audio (energy fade-out before silence)
+        Lowered to 0.20. At this threshold, only pure silence and clear
+        background noise are filtered; all marginal speech passes through.
+
+    FIX P2 — min_silence_duration_ms too short (was 200ms, now 2000ms):
+        At 200ms, Silero treats every inter-word pause as a silence boundary
+        and splits the audio into dozens of tiny chunks. Each chunk is then
+        independently threshold-tested: chunks that begin or end on a quiet
+        phoneme fall below threshold and are dropped entirely.
+        At 2000ms, only genuine long pauses create boundaries. Normal
+        conversational pauses (200–500ms) remain inside speech chunks where
+        they are correctly transcribed.
+
+    FIX P3 — speech_pad_ms too small (was 400ms, now 500ms each side):
+        Padding is added around each speech chunk detected by VAD. Increasing
+        to 500ms ensures that the consonant/vowel at the very start and end of
+        each spoken phrase — where energy is lowest — is captured within the
+        padded boundary rather than being clipped at the edge.
+
+    FIX P5 — log_prob_threshold too strict (was -1.0, now disabled with -3.0):
+        When the average log-probability of a decoded segment is below this
+        threshold, Whisper marks the segment as a decoding failure and
+        silently discards it. This hits hardest on:
+          • short segments (< 1 second) — too few tokens to average reliably
+          • the last segment of the file — often lower confidence
+          • quiet or accented speech
+        Set to -3.0 (effectively disabled) so Whisper always returns its
+        best-effort transcription rather than dropping the segment.
+
+    FIX P6 — no_speech_threshold too high (was 0.45, now 0.3):
+        The no_speech token probability is Whisper's internal confidence that
+        a chunk contains NO speech. At 0.45, even faint speech triggers the
+        no_speech filter. 0.3 means only chunks where Whisper is very
+        confident there is no speech (>70% confidence) are suppressed.
+
+    FIX P7 — No duration logging (now measures actual vs transcribed gap):
+        Added pre-transcription audio duration measurement. After transcription,
+        logs a warning if the transcribed duration is more than 1 second
+        shorter than the actual audio duration, making truncation visible
+        in logs rather than silently producing a shorter-than-expected transcript.
     """
     try:
         whisper_model = get_whisper_model(model_size)
-        
-        # Tanglish is romanised Tamil in Latin script — Whisper has no "tgl" token.
-        # Route it as "en" so Whisper applies correct Latin-script phoneme decoding.
+
+        # Tanglish: route as "en" so Whisper uses Latin-script phoneme decoding
         whisper_language = "en" if language == "tgl" else language
 
-        logger.info(f"Starting transcription with model {model_size}, language: {whisper_language or 'auto-detect'}")
-        
+        # Language-specific seed prompt; fall back to generic English
+        initial_prompt = _INITIAL_PROMPTS.get(
+            whisper_language or "",
+            "The following is a clear spoken audio recording:",
+        )
+
+        # FIX P7: measure actual audio duration before transcription
+        actual_duration = _get_audio_duration(audio_path)
+        logger.info(
+            f"Starting transcription | model={model_size} | "
+            f"lang={whisper_language or 'auto-detect'} | "
+            f"actual_duration={actual_duration:.2f}s | "
+            f"vad_filter={vad_filter} | vad_threshold={vad_threshold}"
+        )
+
         segments, info = whisper_model.transcribe(
             audio_path,
             beam_size=5,
             best_of=5,
-            # Allow fallback temperatures so Whisper retries on decoding failures
             temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
             word_timestamps=word_timestamps,
             language=whisper_language,
-            # Keep VAD enabled but with a shorter minimum silence so less audio is dropped
-            vad_filter=True,
+
+            # ── VAD CONFIGURATION (FIX P1, P2, P3) ─────────────────────────
+            vad_filter=vad_filter,
             vad_parameters=dict(
-                min_silence_duration_ms=200,   # was 500 — reduced to catch short pauses
-                speech_pad_ms=400,             # add padding around detected speech
-                threshold=0.35,                # lower than default (0.5) to be more sensitive
-            ),
-            # Context window: help the model maintain coherent output across segments
+                threshold=vad_threshold,         # FIX P1: caller-controlled, default 0.20
+                min_silence_duration_ms=2000,    # FIX P2: only genuine long pauses split audio
+                speech_pad_ms=500,               # FIX P3: 500ms padding each side
+            ) if vad_filter else {},
+
+            # ── DECODING THRESHOLDS (FIX P5, P6) ────────────────────────────
             condition_on_previous_text=True,
-            # Suppress blank/repetitive hallucinations
             compression_ratio_threshold=2.4,
-            log_prob_threshold=-1.0,
-            no_speech_threshold=0.45,          # was implicitly 0.6 — catch more soft speech
-            # Seed prompt helps ground the model in the right domain
-            initial_prompt="The following is a clear spoken audio recording:",
+            log_prob_threshold=-3.0,             # FIX P5: disabled — never drop segments
+            no_speech_threshold=0.3,             # FIX P6: only suppress very confident silence
+            initial_prompt=initial_prompt,
         )
-        
+
         # Convert generator to list
         segments = list(segments)
-        
-        logger.info(
-            f"Transcription complete: {len(segments)} segments, "
-            f"language: {info.language} (prob: {info.language_probability:.2f})"
-        )
-        
+
+        # FIX P7: log warning if transcription is significantly shorter than audio
+        if segments:
+            transcribed_end = segments[-1].end
+            gap = actual_duration - transcribed_end
+            if actual_duration > 0 and gap > 1.0:
+                logger.warning(
+                    f"TRUNCATION DETECTED: actual={actual_duration:.2f}s  "
+                    f"transcribed_end={transcribed_end:.2f}s  "
+                    f"gap={gap:.2f}s — {gap:.1f}s of audio was not transcribed. "
+                    f"Consider setting vad_filter=False if this persists."
+                )
+            else:
+                logger.info(
+                    f"Transcription complete: {len(segments)} segments | "
+                    f"transcribed={transcribed_end:.2f}s / actual={actual_duration:.2f}s | "
+                    f"lang={info.language} (prob={info.language_probability:.2f})"
+                )
+        else:
+            logger.warning(
+                f"Transcription produced 0 segments for {actual_duration:.2f}s of audio. "
+                f"The audio may be silent, or VAD filtered all content. "
+                f"Check audio quality and language setting."
+            )
+
         return segments, info
-        
+
     except Exception as e:
         logger.error(f"Transcription failed: {e}", exc_info=True)
         raise HTTPException(
@@ -527,9 +712,17 @@ async def speech_to_text(request: SpeechToTextRequest) -> SpeechToTextResponse:
             
             download_from_s3(request.audio_bucket, request.audio_key, audio_path)
             
+            # BUG FIX 10: perform_diarization now returns (segments, success)
             speaker_segments = []
+            diarization_failed = False
             if request.diarize and HUGGINGFACE_TOKEN:
-                speaker_segments = perform_diarization(audio_path)
+                speaker_segments, diar_ok = perform_diarization(audio_path)
+                if not diar_ok:
+                    diarization_failed = True
+                    logger.warning(
+                        "Diarization failed — continuing with SPEAKER_UNKNOWN labels. "
+                        "Check pyannote model access and HF token."
+                    )
             elif request.diarize and not HUGGINGFACE_TOKEN:
                 logger.warning("Diarization requested but HuggingFace token not available")
             
@@ -537,7 +730,9 @@ async def speech_to_text(request: SpeechToTextRequest) -> SpeechToTextResponse:
                 audio_path,
                 language=request.language,
                 model_size=request.model_size,
-                word_timestamps=request.word_timestamps
+                word_timestamps=request.word_timestamps,
+                vad_filter=request.vad_filter,
+                vad_threshold=request.vad_threshold,
             )
             
             transcript = align_speakers_with_transcription(
@@ -546,7 +741,8 @@ async def speech_to_text(request: SpeechToTextRequest) -> SpeechToTextResponse:
             )
             
             speakers_detected = len(set(s["speaker"] for s in transcript))
-            duration = transcript[-1]["end"] if transcript else 0
+            # BUG FIX 9: guard against empty transcript (silent/music-only audio)
+            duration = transcript[-1]["end"] if transcript else 0.0
             processing_time = (datetime.now() - start_time).total_seconds()
             
             result = TranscriptResult(
@@ -563,14 +759,17 @@ async def speech_to_text(request: SpeechToTextRequest) -> SpeechToTextResponse:
                     "model_size": request.model_size,
                     "processing_time_seconds": round(processing_time, 2),
                     "file_size_bytes": file_size,
-                    "timestamp": datetime.utcnow().isoformat()
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "diarization_failed": diarization_failed,   # BUG FIX 10
                 }
             )
             
             with open(output_path, "w", encoding='utf-8') as f:
                 json.dump(result.dict(), f, indent=2, ensure_ascii=False)
             
-            output_key = f"transcripts/{job_id}.json"
+            # BUG FIX 7: respect output_key_prefix from request
+            prefix = (request.output_key_prefix or "transcripts/").rstrip("/")
+            output_key = f"{prefix}/{job_id}.json"
             
             upload_metadata = {
                 "job_id": job_id,

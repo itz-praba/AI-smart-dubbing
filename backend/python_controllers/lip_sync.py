@@ -48,11 +48,14 @@ MAX_SEGMENT_DURATION = 60.0
 # Korean TTS has a ~70-90 ms onset delay before the first phoneme; pre-advancing the
 # placement compensates so the voice starts with the mouth movement, not after it.
 LANG_TIMING_OFFSET_S: dict = {
-    "ko": -0.080,   # advance Korean audio 80 ms (empirical, adjust per TTS model)
-    "ja": -0.060,
-    "zh": -0.050,
-    "ta": -0.060,   # Tamil TTS has similar onset delay to Japanese
-    "tgl": -0.040,  # Tanglish synthesised as English — small onset delay
+    "ko":  -0.080,   # advance Korean audio 80 ms (empirical, adjust per TTS model)
+    "ja":  -0.060,
+    "zh":  -0.050,
+    "ta":  -0.060,   # Tamil TTS has similar onset delay to Japanese
+    "tgl": -0.040,   # Tanglish synthesised as English — small onset delay
+    "hi":  -0.055,   # Hindi (Devanagari) — MMS-TTS onset similar to Tamil
+    "te":  -0.060,   # Telugu — MMS-TTS model has comparable onset delay
+    "ur":  -0.055,   # Urdu — similar to Hindi
 }
 
 MAX_AUDIO_FILE_SIZE = 100 * 1024 * 1024  # 100MB
@@ -60,6 +63,15 @@ ALLOWED_AUDIO_FORMATS = {'.wav', '.mp3', '.m4a', '.flac', '.ogg'}
 
 # FIX #3: Crossfade length in samples to smooth segment joins and avoid clicks
 CROSSFADE_SAMPLES = 512   # ~21ms at 24kHz
+
+# ── Problem 8: Natural pause normalisation ───────────────────────────────────
+# When a gap between two segments is very short (< MIN_NATURAL_GAP_S) the join
+# sounds like an abrupt cut; when it is very long (> MAX_NATURAL_GAP_S) it sounds
+# like dead air. We normalise gaps into the "natural pause" range inside
+# build_timeline_audio so that every line boundary feels organic.
+MIN_NATURAL_GAP_S  = 0.08   # 80ms — below this, extend with a smoothed bridge
+MAX_NATURAL_GAP_S  = 0.45   # 450ms — above this, trim to avoid dead air
+IDEAL_GAP_S        = 0.12   # 120ms — target gap for naturalised short joins
 
 # =====================================================
 # ENVIRONMENT VALIDATION
@@ -302,6 +314,25 @@ def add_silence(audio: np.ndarray, silence_sec: float, sr: int) -> np.ndarray:
     return np.concatenate([audio, silence])
 
 
+def normalise_gap(gap_s: float) -> float:
+    """
+    Problem 8 — Poor editing cuts: normalise the gap between two consecutive
+    dubbed segments so transitions sound natural.
+
+    • Gaps < MIN_NATURAL_GAP_S (abrupt cuts) → padded to IDEAL_GAP_S.
+    • Gaps > MAX_NATURAL_GAP_S (dead air)    → trimmed to MAX_NATURAL_GAP_S.
+    • Gaps in the natural range              → unchanged.
+
+    The normalised gap is returned as a float; the caller uses it when computing
+    the next segment's start_sample offset inside build_timeline_audio.
+    """
+    if gap_s < MIN_NATURAL_GAP_S:
+        return IDEAL_GAP_S
+    if gap_s > MAX_NATURAL_GAP_S:
+        return MAX_NATURAL_GAP_S
+    return gap_s
+
+
 def time_stretch_audio(audio: np.ndarray, sr: int, ratio: float) -> np.ndarray:
     try:
         ratio = max(MAX_SLOW_DOWN, min(ratio, MAX_SPEED_UP))
@@ -466,14 +497,26 @@ def build_timeline_audio(
 
     # Per-language onset pre-advance (negative = move earlier in timeline)
     timing_offset_s = LANG_TIMING_OFFSET_S.get(target_language, 0.0)
+    prev_end_s: Optional[float] = None   # Problem 8: tracks end of previous segment
     
     for seg in sorted(segments, key=lambda s: s.index):
         audio, _ = aligned_audio_map[seg.index]
         
         # Apply language-aware timing offset so audio starts with mouth movement
         adjusted_start = max(0.0, seg.start + timing_offset_s)
+
+        # Problem 8 — Natural pause normalisation:
+        # If this is not the first segment, compute the gap to the previous
+        # segment's end and normalise it so edits never sound abrupt or dead.
+        if prev_end_s is not None:
+            raw_gap = adjusted_start - prev_end_s
+            nice_gap = normalise_gap(raw_gap)
+            if raw_gap != nice_gap:
+                adjusted_start = prev_end_s + nice_gap
+
         start_sample = int(round(adjusted_start * sr))
         end_sample = start_sample + len(audio)
+        prev_end_s = adjusted_start + len(audio) / sr
         
         if end_sample > total_samples:
             # Trim if the segment runs slightly over (due to time-stretch rounding)

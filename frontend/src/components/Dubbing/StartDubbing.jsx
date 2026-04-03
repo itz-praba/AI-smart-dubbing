@@ -26,6 +26,7 @@ export default function StartDubbing() {
   const languages = [
   { label: "English", value: "en" },
   { label: "Tamil", value: "ta" },
+  { label: "Hindi", value: "hi" },
   { label: "Spanish", value: "es" },
   { label: "French", value: "fr" },
   { label: "German", value: "de" },
@@ -96,6 +97,9 @@ const handleStartDubbing = async () => {
         comp_threshold_db: -24.0, 
         comp_ratio: 4.0, 
         comp_makeup_db: 6.0,
+        enable_segment_validation: true,
+        enable_cultural_adaptation: true,
+        enable_prosody_transfer: true,
       },
       {
         headers: {
